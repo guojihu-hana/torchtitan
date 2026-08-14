@@ -219,6 +219,26 @@ def build_features_test_list() -> list[OverrideDefinitions]:
             [
                 [
                     "--checkpoint.enable",
+                    "--async_eval.enable",
+                    "--async_eval.freq 5",
+                    "--async_eval.raise_on_failure",
+                    "--async_eval.extra_args='--validator.dataloader.dataset "
+                    "c4_test --validator.steps 2'",
+                ],
+            ],
+            "Checkpoint Integration Test - Async eval on a dedicated GPU",
+            "async_eval",
+            # Reserve two GPUs, but keep the training world on the first one.
+            # The runner fills this option with the second physical GPU id.
+            ngpu=2,
+            train_ngpu=1,
+            extra_gpu_arg="--async_eval.cuda_visible_devices",
+            skip_rocm_test=True,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--checkpoint.enable",
                     "--checkpoint.folder hf_checkpoint",
                     "--checkpoint.last_save_model_only",
                     "--checkpoint.last_save_in_hf",

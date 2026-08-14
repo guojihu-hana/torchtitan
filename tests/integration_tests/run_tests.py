@@ -107,26 +107,33 @@ def run_single_test(
     output_dir: str,
     module: str | None = None,
     config: str | None = None,
-    # ``gpu_ids`` is set only in parallel mode; sequential runs leave the
-    # child process to use all visible GPUs.
+    # ``gpu_ids`` is set only in parallel mode. Sequential runs use physical
+    # ids from zero through ``test_flavor.ngpu - 1`` when partitioning GPUs.
     gpu_ids: list[int] | None = None,
 ):
     # run_test supports sequence of tests.
     test_name = test_flavor.test_name
     dump_folder_arg = f"--dump_folder {output_dir}/{test_name}"
 
-    all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
+    train_ngpu = test_flavor.train_ngpu or test_flavor.ngpu
+    all_ranks = ",".join(map(str, range(train_ngpu)))
 
-    # When running in parallel, pin each test to a disjoint subset of physical
-    # GPUs. Setting both CUDA_/HIP_VISIBLE_DEVICES makes this a no-op for the
-    # arch that doesn't apply.
-    if gpu_ids is not None:
-        visible = ",".join(map(str, gpu_ids))
+    allocated_gpu_ids = gpu_ids or list(range(test_flavor.ngpu))
+    # Pin training to its portion of the allocated GPUs. A test may reserve
+    # additional GPUs for a subprocess without adding them to the train world.
+    if gpu_ids is not None or test_flavor.train_ngpu is not None:
+        train_visible = ",".join(map(str, allocated_gpu_ids[:train_ngpu]))
         gpu_env_prefix = (
-            f"CUDA_VISIBLE_DEVICES={visible} HIP_VISIBLE_DEVICES={visible} "
+            f"CUDA_VISIBLE_DEVICES={train_visible} "
+            f"HIP_VISIBLE_DEVICES={train_visible} "
         )
     else:
         gpu_env_prefix = ""
+
+    extra_gpu_override = ""
+    if test_flavor.extra_gpu_arg is not None:
+        extra_visible = ",".join(map(str, allocated_gpu_ids[train_ngpu:]))
+        extra_gpu_override = f" {test_flavor.extra_gpu_arg} {extra_visible}"
 
     for override_arg in test_flavor.override_args:
         cmd = ""
@@ -135,7 +142,7 @@ def run_single_test(
         if config is not None:
             cmd += f"CONFIG={config} "
         cmd += (
-            f"{gpu_env_prefix}NGPU={test_flavor.ngpu} LOG_RANK={all_ranks} "
+            f"{gpu_env_prefix}NGPU={train_ngpu} LOG_RANK={all_ranks} "
             f"./run_train.sh"
         )
 
@@ -143,6 +150,7 @@ def run_single_test(
         cmd = f'TORCH_TRACE="{output_dir}/{test_name}/compile_trace" ' + cmd
 
         cmd += " " + dump_folder_arg
+        cmd += extra_gpu_override
         if override_arg:
             cmd += " " + " ".join(override_arg)
 

@@ -150,6 +150,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             "TorchCheckpointingManager does not implement save() yet."
         )
 
+    def _save_for_async_eval(self, curr_step: int) -> tuple[str, bool]:
+        raise NotImplementedError(
+            "TorchCheckpointingManager does not implement async eval saves yet."
+        )
+
     def _wait_for_saving(self) -> None:
         raise NotImplementedError(
             "TorchCheckpointingManager does not implement saving yet."

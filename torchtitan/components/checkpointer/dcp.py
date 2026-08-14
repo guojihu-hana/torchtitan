@@ -471,6 +471,42 @@ class CheckpointManager(BaseCheckpointManager):
         )
         return True
 
+    @sl.log_trace_span("async_eval_checkpoint_save")
+    @torch.no_grad()
+    def _save_for_async_eval(self, curr_step: int) -> tuple[str, bool]:
+        """Save or reuse a model checkpoint for an async evaluation job."""
+        self.maybe_wait_for_saving()
+
+        regular_checkpoint_id = self._create_checkpoint_id(curr_step)
+        if self._has_dcp_checkpoint(regular_checkpoint_id):
+            logger.info(
+                "Reusing the training checkpoint for async eval: %s",
+                regular_checkpoint_id,
+            )
+            return regular_checkpoint_id, False
+
+        eval_folder = filesystem.join(self.folder, "async_eval")
+        checkpoint_id = self._create_checkpoint_id(curr_step, folder=eval_folder)
+        if self._has_dcp_checkpoint(checkpoint_id):
+            logger.info("Reusing the async eval checkpoint: %s", checkpoint_id)
+            return checkpoint_id, True
+
+        logger.info(
+            "Saving a model only checkpoint for async eval at step %d.", curr_step
+        )
+        self.dcp_save(
+            self.states[MODEL].state_dict(),
+            checkpoint_id=checkpoint_id,
+            async_mode=AsyncMode.DISABLED,
+            enable_garbage_collection=True,
+        )
+        return checkpoint_id, True
+
+    def _has_dcp_checkpoint(self, checkpoint_id: str) -> bool:
+        return filesystem.isdir(checkpoint_id) and filesystem.isfile(
+            filesystem.join(checkpoint_id, ".metadata")
+        )
+
     @sl.log_trace_span("checkpoint_load")
     @torch.no_grad()
     def _load(self, step: int = -1) -> bool:

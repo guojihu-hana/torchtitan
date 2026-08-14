@@ -174,6 +174,16 @@ class BaseCheckpointManager(Configurable, ABC):
             return False
         return self._save(curr_step, last_step)
 
+    def save_for_async_eval(self, curr_step: int) -> tuple[str, bool]:
+        """Persist model state for async evaluation.
+
+        Returns the checkpoint path and whether the checkpoint was created only
+        for evaluation and can be deleted after evaluation finishes.
+        """
+        if not self.enable:
+            raise ValueError("Cannot save an async eval checkpoint when disabled.")
+        return self._save_for_async_eval(curr_step)
+
     def maybe_wait_for_staging(self) -> None:
         """Block until asynchronous staging for the last save completes."""
         if not self.enable:
@@ -210,6 +220,10 @@ class BaseCheckpointManager(Configurable, ABC):
     @abstractmethod
     def _save(self, curr_step: int, last_step: bool = False) -> bool:
         """Implement ``save``. Only called when checkpointing is enabled."""
+
+    @abstractmethod
+    def _save_for_async_eval(self, curr_step: int) -> tuple[str, bool]:
+        """Implement ``save_for_async_eval`` when checkpointing is enabled."""
 
     @abstractmethod
     def _maybe_wait_for_staging(self) -> None:
