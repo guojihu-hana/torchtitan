@@ -117,6 +117,7 @@ def build_trainer_model(
         pp=parallelism.pipeline_parallel_degree,
         ep=parallelism.expert_parallel_degree,
         world_size=dist.get_world_size(),
+        spmd_backend=parallelism.spmd_backend,
     )
 
     dist_utils.set_determinism(
@@ -577,6 +578,7 @@ class BitwiseParityTestBase(unittest.TestCase):
 
     config_fn = staticmethod(rl_grpo_qwen3_0_6b_varlen_batch_invariant)
     attn_backend: str = "varlen"
+    spmd_backend: str = "partial_dtensor"
     min_world_size: int = 1
     hf_assets_env_var: str = "HF_ASSETS_PATH"
     # Root dir for run artifacts (NCCL flight-recorder comm_traces). CI sets it
@@ -605,6 +607,22 @@ class BitwiseParityTestBase(unittest.TestCase):
             )
 
         config = cls.config_fn()
+        # Keep cross-runtime parity coverage on the backend it was designed
+        # for. Backend-specific parity tests can opt in by overriding this.
+        config.trainer = dataclasses.replace(
+            config.trainer,
+            parallelism=dataclasses.replace(
+                config.trainer.parallelism,
+                spmd_backend=cls.spmd_backend,
+            ),
+        )
+        config.generator = dataclasses.replace(
+            config.generator,
+            parallelism=dataclasses.replace(
+                config.generator.parallelism,
+                spmd_backend=cls.spmd_backend,
+            ),
+        )
         hf_path = os.environ.get(cls.hf_assets_env_var)
         if hf_path:
             config.hf_assets_path = hf_path
