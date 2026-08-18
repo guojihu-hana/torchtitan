@@ -41,7 +41,7 @@ def flux_debugmodel() -> FluxTrainer.Config:
             decay_ratio=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=4,
+            num_tokens_per_microbatch_per_dp_rank=2048,
             max_norm=2.0,
             steps=10,
             disable_cuda_graphs=True,
@@ -50,7 +50,10 @@ def flux_debugmodel() -> FluxTrainer.Config:
             prompt_dropout_prob=0.447,
             img_size=256,
         ),
-        parallelism=ParallelismConfig(context_parallel_degree=1),
+        parallelism=ParallelismConfig(
+            context_parallel_degree=1,
+            context_parallel_load_balancer="headtail",
+        ),
         activation_checkpoint=FullAC.Config(),
         checkpoint=CheckpointManager.Config(
             interval=10,
@@ -104,7 +107,7 @@ def flux_dev() -> FluxTrainer.Config:
             decay_ratio=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=32,
+            num_tokens_per_microbatch_per_dp_rank=24576,
             steps=30000,
             disable_cuda_graphs=True,
         ),
@@ -112,6 +115,9 @@ def flux_dev() -> FluxTrainer.Config:
             dataset="cc12m-wds",
             prompt_dropout_prob=0.447,
             img_size=256,
+        ),
+        parallelism=ParallelismConfig(
+            context_parallel_load_balancer="headtail",
         ),
         activation_checkpoint=FullAC.Config(),
         checkpoint=CheckpointManager.Config(interval=1000),
@@ -155,7 +161,7 @@ def flux_schnell() -> FluxTrainer.Config:
             decay_ratio=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=64,
+            num_tokens_per_microbatch_per_dp_rank=32768,
             steps=30000,
             disable_cuda_graphs=True,
         ),
@@ -163,6 +169,9 @@ def flux_schnell() -> FluxTrainer.Config:
             dataset="cc12m-wds",
             prompt_dropout_prob=0.447,
             img_size=256,
+        ),
+        parallelism=ParallelismConfig(
+            context_parallel_load_balancer="headtail",
         ),
         activation_checkpoint=FullAC.Config(),
         checkpoint=CheckpointManager.Config(interval=1000),

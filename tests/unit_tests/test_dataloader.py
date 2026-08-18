@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 import unittest
 
+import torch
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
@@ -141,8 +143,8 @@ class TestParallelAwareDataloader(unittest.TestCase):
         # Verify that batch_size is the explicit one, not the config one
         self.assertEqual(dataloader.batch_size, explicit_batch_size)
 
-    def test_build_dataloader_with_trainer_config(self):
-        """Verify batch_size from training.local_batch_size is correctly used."""
+    def test_build_packed_token_dataloader(self):
+        """Verify the DP-rank token budget is returned without batching."""
         tokenizer = DummyTokenizer()
 
         dl_config = HuggingFaceTextDataLoader.Config(
@@ -155,11 +157,11 @@ class TestParallelAwareDataloader(unittest.TestCase):
             dp_world_size=1,
             dp_rank=0,
             tokenizer=tokenizer,
-            seq_len=512,
-            local_batch_size=8,
+            max_context_length=512,
+            num_tokens_per_batch=4096,
         )
 
-        self.assertEqual(dataloader.batch_size, 8)
+        self.assertIsNone(dataloader.batch_size)
         self.assertEqual(dataloader.num_workers, 2)
 
     def test_positions_matching_sequences(self):
@@ -176,30 +178,28 @@ class TestParallelAwareDataloader(unittest.TestCase):
             dp_world_size=1,
             dp_rank=0,
             tokenizer=tokenizer,
-            seq_len=(seq_len := 512),
-            local_batch_size=8,
+            max_context_length=(max_context_length := 512),
+            num_tokens_per_batch=4096,
         )
 
-        for batch, _ in zip(map(lambda x: x[0], dataloader), range(10)):
+        for batch, _ in itertools.islice(dataloader, 10):
             batch_input_ids = batch["input"]
             batch_positions = batch["positions"]
-            for input_ids, positions in zip(batch_input_ids, batch_positions):
-                for i, (tok, pos) in enumerate(zip(input_ids, positions)):
-                    # pos is less then seq_len
-                    self.assertLess(pos.item(), seq_len)
-                    self.assertGreaterEqual(pos.item(), 0)
-                    if i == 0:
-                        # First token should always have position 0
-                        self.assertEqual(pos.item(), 0)
-                    if i > 0 and pos.item() > 0:
-                        # Position should increment by 1 for each subsequent token
-                        self.assertEqual(pos.item(), positions[i - 1].item() + 1)
-                    if tok == tokenizer.eos_id and i < len(input_ids) - 1:
-                        # After EOS, positions should reset to 0
-                        self.assertEqual(positions[i + 1].item(), 0)
-                    if tok == tokenizer.bos_id and i > 0:
-                        # BOS token should have position 0
-                        self.assertEqual(pos.item(), 0)
+            self.assertEqual(batch_input_ids.shape, (4096,))
+            self.assertEqual(batch_positions.shape, (4096,))
+            for i, (tok, pos) in enumerate(
+                zip(batch_input_ids, batch_positions, strict=True)
+            ):
+                self.assertLess(pos.item(), max_context_length)
+                self.assertGreaterEqual(pos.item(), 0)
+                if i % max_context_length == 0:
+                    self.assertEqual(pos.item(), 0)
+                if i > 0 and pos.item() > 0:
+                    self.assertEqual(pos.item(), batch_positions[i - 1].item() + 1)
+                if tok == tokenizer.eos_id and i < len(batch_input_ids) - 1:
+                    self.assertEqual(batch_positions[i + 1].item(), 0)
+                if tok == tokenizer.bos_id and i > 0:
+                    self.assertEqual(pos.item(), 0)
 
 
 class TestInterleavedHuggingFaceTextDataLoader(unittest.TestCase):
@@ -232,15 +232,15 @@ class TestInterleavedHuggingFaceTextDataLoader(unittest.TestCase):
         self.assertIn("infinite", str(ctx.exception))
 
     def test_construction_batch_size_and_num_workers(self):
-        """Verify local_batch_size and num_workers are correctly plumbed through."""
+        """Verify token chunks per batch and workers are configured."""
         config = self._make_config(num_workers=2)
         dataloader = InterleavedHuggingFaceTextDataLoader(
             config,
             dp_world_size=1,
             dp_rank=0,
             tokenizer=DummyTokenizer(),
-            seq_len=512,
-            local_batch_size=4,
+            max_context_length=512,
+            num_tokens_per_batch=4 * 512,
         )
         self.assertEqual(dataloader.batch_size, 4)
         self.assertEqual(dataloader.num_workers, 2)
@@ -253,14 +253,15 @@ class TestInterleavedHuggingFaceTextDataLoader(unittest.TestCase):
             dp_world_size=1,
             dp_rank=0,
             tokenizer=DummyTokenizer(),
-            seq_len=512,
-            local_batch_size=2,
+            max_context_length=512,
+            num_tokens_per_batch=2 * 512,
         )
         batch_input, batch_label = next(iter(dataloader))
         self.assertIn("input", batch_input)
         self.assertIn("positions", batch_input)
-        self.assertEqual(batch_input["input"].shape[0], 2)  # batch size
-        self.assertEqual(batch_input["input"].shape[1], 512)  # seq_len
+        self.assertEqual(batch_input["input"].shape, (2 * 512,))
+        self.assertEqual(batch_input["positions"].shape, (2 * 512,))
+        self.assertEqual(batch_label.shape, (2 * 512,))
 
     def test_single_source_equivalent_to_huggingfacetextdataloader(self):
         """A single-source interleaved dataloader must produce the same batch
@@ -276,8 +277,8 @@ class TestInterleavedHuggingFaceTextDataLoader(unittest.TestCase):
             dp_world_size=1,
             dp_rank=0,
             tokenizer=tokenizer,
-            seq_len=seq_len,
-            local_batch_size=local_batch_size,
+            max_context_length=seq_len,
+            num_tokens_per_batch=local_batch_size * seq_len,
         )
 
         interleaved_dl = InterleavedHuggingFaceTextDataLoader(
@@ -287,20 +288,36 @@ class TestInterleavedHuggingFaceTextDataLoader(unittest.TestCase):
             dp_world_size=1,
             dp_rank=0,
             tokenizer=tokenizer,
-            seq_len=seq_len,
-            local_batch_size=local_batch_size,
+            max_context_length=seq_len,
+            num_tokens_per_batch=local_batch_size * seq_len,
         )
 
-        single_batch_input, _ = next(iter(single_dl))
-        interleaved_batch_input, _ = next(iter(interleaved_dl))
+        single_batch_input, single_batch_labels = next(iter(single_dl))
+        interleaved_batch_input, interleaved_batch_labels = next(iter(interleaved_dl))
 
-        self.assertEqual(
-            single_batch_input["input"].shape,
-            interleaved_batch_input["input"].shape,
+        self.assertTrue(
+            bool(
+                torch.equal(
+                    single_batch_input["input"],
+                    interleaved_batch_input["input"],
+                )
+            )
         )
-        self.assertEqual(
-            single_batch_input["positions"].shape,
-            interleaved_batch_input["positions"].shape,
+        self.assertTrue(
+            bool(
+                torch.equal(
+                    single_batch_input["positions"],
+                    interleaved_batch_input["positions"],
+                )
+            )
+        )
+        self.assertTrue(
+            bool(
+                torch.equal(
+                    single_batch_labels,
+                    interleaved_batch_labels,
+                )
+            )
         )
 
 

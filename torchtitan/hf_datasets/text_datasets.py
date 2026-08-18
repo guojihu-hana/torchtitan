@@ -54,6 +54,21 @@ DATASETS = {
 }
 
 
+def _collate_token_chunks(
+    samples: list[tuple[dict[str, torch.Tensor], torch.Tensor]],
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Concatenate fixed-length token chunks into one flat token batch."""
+    input_dicts, labels = zip(*samples, strict=True)
+    input_keys = input_dicts[0].keys()
+    return (
+        {
+            key: torch.cat([input_dict[key] for input_dict in input_dicts])
+            for key in input_keys
+        },
+        torch.cat(labels),
+    )
+
+
 def _validate_dataset(
     dataset_name: str, dataset_path: str | None = None
 ) -> tuple[str, Callable, Callable]:
@@ -76,7 +91,8 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         dataset_name: str,
         dataset_path: str | None,
         tokenizer: BaseTokenizer,
-        seq_len: int = 2048,
+        max_context_length: int = 2048,
+        num_tokens_per_batch: int = 16384,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
@@ -95,7 +111,8 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         self._original_data = split_dataset_by_node(ds, dp_rank, dp_world_size)
         self._data = self._original_data
         self._tokenizer = tokenizer
-        self.seq_len = seq_len
+        self.max_context_length = max_context_length
+        self.num_tokens_per_batch = num_tokens_per_batch
         self.infinite = infinite
         self._text_processor = text_processor
 
@@ -126,6 +143,15 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 positions[i] = p - offset
         return positions
 
+    def _get_batch_positions(self) -> torch.Tensor:
+        positions: list[int] = []
+        for start in range(0, self.num_tokens_per_batch, self.max_context_length):
+            end = min(start + self.max_context_length, self.num_tokens_per_batch)
+            positions.extend(
+                self._normalize_positions(self._positions_buffer[start:end])
+            )
+        return torch.LongTensor(positions)
+
     def __iter__(self):
         while True:
             for sample in self._get_data_iter():
@@ -138,30 +164,36 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 # Shift inputs and labels within the document, so the target of
                 # a document's last token is never the next document's first
                 # token. The buffers are therefore already next-token aligned
-                # and a full sample is exactly seq_len tokens.
+                # and a full batch is exactly num_tokens_per_batch tokens.
                 self._inputs_buffer.extend(sample_tokens[:-1])
                 self._labels_buffer.extend(sample_tokens[1:])
                 # Per-document positions reset at document boundaries,
                 # matching inference frameworks (e.g. vLLM) that start
-                # positions at 0 per request.  Positions wrap at seq_len
-                # to stay within the RoPE cache, effectively chunking
-                # long documents into seq_len-sized segments.
+                # positions at 0 per request. Positions also reset at
+                # max_context_length packing boundaries to preserve the isolation
+                # previously provided by separate sequence rows.
                 # TODO: make overflow policy configurable (chunk / truncate / drop).
                 self._positions_buffer.extend(range(len(sample_tokens) - 1))
                 self._sample_idx += 1
 
-                while len(self._inputs_buffer) >= self.seq_len:
-                    input_ids = torch.LongTensor(self._inputs_buffer[: self.seq_len])
-                    label_ids = torch.LongTensor(self._labels_buffer[: self.seq_len])
-                    positions = torch.LongTensor(
-                        self._normalize_positions(
-                            self._positions_buffer[: self.seq_len]
-                        )
+                while len(self._inputs_buffer) >= self.num_tokens_per_batch:
+                    input_ids = torch.LongTensor(
+                        self._inputs_buffer[: self.num_tokens_per_batch]
                     )
+                    label_ids = torch.LongTensor(
+                        self._labels_buffer[: self.num_tokens_per_batch]
+                    )
+                    positions = self._get_batch_positions()
                     # update buffers to the remaining tokens
-                    self._inputs_buffer = self._inputs_buffer[self.seq_len :]
-                    self._labels_buffer = self._labels_buffer[self.seq_len :]
-                    self._positions_buffer = self._positions_buffer[self.seq_len :]
+                    self._inputs_buffer = self._inputs_buffer[
+                        self.num_tokens_per_batch :
+                    ]
+                    self._labels_buffer = self._labels_buffer[
+                        self.num_tokens_per_batch :
+                    ]
+                    self._positions_buffer = self._positions_buffer[
+                        self.num_tokens_per_batch :
+                    ]
 
                     yield {"input": input_ids, "positions": positions}, label_ids
 
@@ -239,7 +271,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
     """Configurable text dataloader that wraps HuggingFaceTextDataset.
 
     This dataloader can be used for both training and validation by
-    configuring the appropriate dataset, seq_len, batch_size, etc.
+    configuring the appropriate dataset and token budget.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -257,8 +289,8 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ):
@@ -266,7 +298,8 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             dataset_name=config.dataset,
             dataset_path=config.dataset_path,
             tokenizer=tokenizer,
-            seq_len=seq_len,
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
@@ -278,7 +311,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
             "snapshot_every_n_steps": snapshot_every_n_steps,
-            "batch_size": local_batch_size,
+            "batch_size": None,
         }
 
         super().__init__(
@@ -330,20 +363,26 @@ class InterleavedHuggingFaceTextDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ):
-        # output from each source is already packed
-        # making interleaved weights a token mixture ratio
+        if num_tokens_per_batch % max_context_length != 0:
+            raise ValueError(
+                "num_tokens_per_batch must be evenly divisible by max_context_length "
+                "because interleaved sources produce fixed max_context_length token chunks."
+            )
+        # Each weighted draw contributes max_context_length token slots, so source
+        # weights remain token-mixture ratios after flattening the draws.
         ds = InterleavedDataset(
             datasets=[
                 HuggingFaceTextDataset(
                     dataset_name=source.dataset,
                     dataset_path=source.dataset_path,
                     tokenizer=tokenizer,
-                    seq_len=seq_len,
+                    max_context_length=max_context_length,
+                    num_tokens_per_batch=max_context_length,
                     dp_rank=dp_rank,
                     dp_world_size=dp_world_size,
                     infinite=source.infinite,
@@ -361,7 +400,9 @@ class InterleavedHuggingFaceTextDataLoader(ParallelAwareDataloader):
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
             "snapshot_every_n_steps": snapshot_every_n_steps,
-            "batch_size": local_batch_size,
+            "batch_size": num_tokens_per_batch // max_context_length,
+            "collate_fn": _collate_token_chunks,
+            "drop_last": True,
         }
 
         super().__init__(
@@ -385,7 +426,8 @@ class ChatDataset(IterableDataset, Stateful):
         dataset: Dataset,
         tokenizer: BaseTokenizer,
         sample_processor: Callable,
-        seq_len: int = 2048,
+        max_context_length: int = 2048,
+        num_tokens_per_batch: int = 16384,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
@@ -394,6 +436,15 @@ class ChatDataset(IterableDataset, Stateful):
             raise ValueError(
                 "Tokenizer does not have an eos_id set. "
                 "ChatDataset requires a tokenizer with a valid EOS token."
+            )
+        if max_context_length <= 0:
+            raise ValueError("max_context_length must be greater than 0.")
+        if num_tokens_per_batch <= 0:
+            raise ValueError("num_tokens_per_batch must be greater than 0.")
+        if num_tokens_per_batch < max_context_length:
+            raise ValueError(
+                "num_tokens_per_batch must be greater than or equal to max_context_length "
+                "so an accepted chat sample fits within one batch."
             )
 
         # Shuffle the initial data to promote an even distribution across nodes. For map-style
@@ -405,7 +456,8 @@ class ChatDataset(IterableDataset, Stateful):
         self._data = self._original_data
         self._tokenizer = tokenizer
         self._eos_id = tokenizer.eos_id
-        self.seq_len = seq_len
+        self.max_context_length = max_context_length
+        self.num_tokens_per_batch = num_tokens_per_batch
         self.infinite = infinite
         self._sample_processor = sample_processor
 
@@ -454,7 +506,7 @@ class ChatDataset(IterableDataset, Stateful):
 
         Returns (input_ids, label_ids) where input_ids = tokens[:-1] and
         label_ids = tokens[1:] with prompt tokens masked as IGNORE_INDEX.
-        Returns None if the sample exceeds seq_len (dropped to avoid
+        Returns None if the sample exceeds max_context_length (dropped to avoid
         training on truncated responses).
 
         Uses incremental prefix re-tokenization to find the prompt/response
@@ -474,11 +526,11 @@ class ChatDataset(IterableDataset, Stateful):
             logger.info(f"[ChatDataset] First sample full:\n{full_text}")
             self._logged_first_sample = True
 
-        # Drop examples exceeding seq_len rather than truncating.
-        if len(full_tokens) - 1 > self.seq_len:
+        # Drop examples exceeding max_context_length rather than truncating.
+        if len(full_tokens) - 1 > self.max_context_length:
             logger.debug(
                 f"Dropping sample {self._sample_idx}: "
-                f"tokens exceeds seq_len {self.seq_len}"
+                f"tokens exceeds max_context_length {self.max_context_length}"
             )
             return None
 
@@ -503,11 +555,23 @@ class ChatDataset(IterableDataset, Stateful):
     def __iter__(self):
         yield from self._iter_greedy_packed()
 
+    def _append_sample(self, input_ids: list[int], label_ids: list[int]) -> None:
+        self._inputs_buffer.extend(input_ids)
+        self._labels_buffer.extend(label_ids)
+        self._positions_buffer.extend(range(len(input_ids)))
+        self._sample_idx += 1
+
+    def _pad_batch(self, pad_len: int) -> None:
+        self._inputs_buffer.extend([self._eos_id] * pad_len)
+        self._labels_buffer.extend([IGNORE_INDEX] * pad_len)
+        self._positions_buffer.extend(range(pad_len))
+
     def _iter_greedy_packed(self):
-        """Greedy packing: pack examples sequentially until seq_len is full.
-        Document boundaries are marked by EOS tokens between packed examples.
-        The model's flex/varlen attention mask uses these EOS positions to
-        prevent cross-document attention.
+        """Pack whole examples into a flat token batch.
+
+        Position resets mark example boundaries for packed-document attention.
+        An example that does not fit in the current batch is carried whole to
+        the next one, and the unused tail is filled with ignored padding.
         """
         # resume from ckpt edge case
         if self._pending_input_ids:
@@ -515,11 +579,8 @@ class ChatDataset(IterableDataset, Stateful):
             label_ids = self._pending_label_ids
             self._pending_input_ids = []
             self._pending_label_ids = []
-            self._inputs_buffer.extend(input_ids)
-            self._labels_buffer.extend(label_ids)
-            self._positions_buffer.extend(range(len(input_ids)))
-            self._sample_idx += 1
-            if len(self._inputs_buffer) == self.seq_len:
+            self._append_sample(input_ids, label_ids)
+            if len(self._inputs_buffer) == self.num_tokens_per_batch:
                 yield self._flush_buffers()
         while True:
             for sample in self._get_data_iter():
@@ -530,39 +591,29 @@ class ChatDataset(IterableDataset, Stateful):
                     continue
 
                 input_ids, label_ids = result
-                remaining = self.seq_len - len(self._inputs_buffer)
+                remaining = self.num_tokens_per_batch - len(self._inputs_buffer)
 
-                # If the example doesn't fit, pad and yield current buffer
-                if len(input_ids) > remaining and len(self._inputs_buffer) > 0:
-                    pad_len = remaining
-                    self._inputs_buffer.extend([self._eos_id] * pad_len)
-                    self._labels_buffer.extend([IGNORE_INDEX] * pad_len)
-                    self._positions_buffer.extend(range(pad_len))
+                if len(input_ids) > remaining:
+                    self._pad_batch(remaining)
                     self._pending_input_ids = input_ids
                     self._pending_label_ids = label_ids
                     yield self._flush_buffers()
-                    # resumed generator continues here or fresh generator handles pending at top (resume path)
+                    # The same generator resumes here, while a restored
+                    # generator consumes the pending sample at function entry.
                     input_ids = self._pending_input_ids
                     label_ids = self._pending_label_ids
                     self._pending_input_ids = []
                     self._pending_label_ids = []
 
                 # Add example to buffer with positions resetting to 0
-                self._inputs_buffer.extend(input_ids)
-                self._labels_buffer.extend(label_ids)
-                self._positions_buffer.extend(range(len(input_ids)))
-                self._sample_idx += 1
+                self._append_sample(input_ids, label_ids)
 
-                if len(self._inputs_buffer) == self.seq_len:
+                if len(self._inputs_buffer) == self.num_tokens_per_batch:
                     yield self._flush_buffers()
 
             # Flush remaining buffer at end of data
             if len(self._inputs_buffer) > 0:
-                pad_len = self.seq_len - len(self._inputs_buffer)
-                if pad_len > 0:
-                    self._inputs_buffer.extend([self._eos_id] * pad_len)
-                    self._labels_buffer.extend([IGNORE_INDEX] * pad_len)
-                    self._positions_buffer.extend(range(pad_len))
+                self._pad_batch(self.num_tokens_per_batch - len(self._inputs_buffer))
 
                 yield self._flush_buffers()
 
@@ -589,6 +640,9 @@ class ChatDataset(IterableDataset, Stateful):
 
     def _flush_buffers(self):
         """Convert buffers to tensors, clear them, and return the batch."""
+        assert len(self._inputs_buffer) == self.num_tokens_per_batch
+        assert len(self._labels_buffer) == self.num_tokens_per_batch
+        assert len(self._positions_buffer) == self.num_tokens_per_batch
         input_tensor = torch.tensor(self._inputs_buffer, dtype=torch.long)
         label_tensor = torch.tensor(self._labels_buffer, dtype=torch.long)
         positions_tensor = torch.tensor(self._positions_buffer, dtype=torch.long)
@@ -669,8 +723,8 @@ class ChatDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ):
@@ -680,7 +734,8 @@ class ChatDataLoader(ParallelAwareDataloader):
             dataset=dataset,
             tokenizer=tokenizer,
             sample_processor=config.sample_processor,
-            seq_len=seq_len,
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
@@ -692,7 +747,7 @@ class ChatDataLoader(ParallelAwareDataloader):
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
             "snapshot_every_n_steps": snapshot_every_n_steps,
-            "batch_size": local_batch_size,
+            "batch_size": None,
         }
 
         super().__init__(
@@ -744,13 +799,13 @@ class InterleavedChatDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: BaseTokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         snapshot_every_n_steps: int | None = 1,
         **kwargs,
     ):
-        # output from each source is already packed
-        # making interleaved weights a token mixture ratio
+        # Every source yields the same number of token slots, so each weighted
+        # draw preserves the configured token-slot mixture ratio.
         ds = InterleavedDataset(
             datasets=[
                 ChatDataset(
@@ -759,7 +814,8 @@ class InterleavedChatDataLoader(ParallelAwareDataloader):
                     ),
                     tokenizer=tokenizer,
                     sample_processor=source.sample_processor,
-                    seq_len=seq_len,
+                    max_context_length=max_context_length,
+                    num_tokens_per_batch=num_tokens_per_batch,
                     dp_rank=dp_rank,
                     dp_world_size=dp_world_size,
                     infinite=source.infinite,
@@ -777,7 +833,7 @@ class InterleavedChatDataLoader(ParallelAwareDataloader):
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
             "snapshot_every_n_steps": snapshot_every_n_steps,
-            "batch_size": local_batch_size,
+            "batch_size": None,
         }
 
         super().__init__(

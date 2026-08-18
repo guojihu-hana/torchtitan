@@ -35,6 +35,8 @@ from torchtitan.tools.logging import logger
 def apply_cp_to_forward(
     attention_modules: Sequence[nn.Module],
     cp_mesh: DeviceMesh,
+    *,
+    attention_seq_dim: int = 0,
 ) -> None:
     """Wrap inner attention ``forward`` with CP logic.
 
@@ -52,6 +54,9 @@ def apply_cp_to_forward(
     Args:
         attention_modules: Sequence of inner attention modules to apply CP to.
         cp_mesh: Device mesh for context parallel dimension.
+        attention_seq_dim: Sequence dimension of the tensors passed to the
+            attention module. Defaults to 0. Can be changed if the attention
+            tensors use a different sequence dimension layout.
     """
     first = attention_modules[0]
     if isinstance(first, FlexAttention):
@@ -70,7 +75,9 @@ def apply_cp_to_forward(
                         )
                     k = k.contiguous()
                     v = v.contiguous()
-                    global_k, global_v = flex_cp_allgather(k, v, 1, pg_name)
+                    global_k, global_v = flex_cp_allgather(
+                        k, v, attention_seq_dim, pg_name
+                    )
                     return orig_fn(q, global_k, global_v, **kwargs)
 
                 return cp_forward
@@ -84,7 +91,7 @@ def apply_cp_to_forward(
             original_forward = mod.forward
 
             def _make_cp_forward(orig_fn, mesh):
-                placement = [Shard(1)]
+                placement = [Shard(attention_seq_dim)]
 
                 def cp_forward(q, k, v, **kwargs):
                     if not isinstance(q, DTensor):
@@ -117,7 +124,7 @@ def prepare_context_parallel_input(
     extra_kwargs: dict[str, Any],
     cp_mesh: DeviceMesh,
     device: torch.device,
-    load_balancer_type: str | None = "headtail",
+    load_balancer_type: str | None = "ptrr",
     ptrr_mask_key: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """
@@ -128,14 +135,14 @@ def prepare_context_parallel_input(
     upstream in ``post_dataloading_process``.
 
     Args:
-        inputs: Input tensor of shape [batch_size, seq_len]
-        labels: Label tensor of shape [batch_size, seq_len]
+        inputs: Input tensor of shape ``[num_tokens]``.
+        labels: Label tensor of shape ``[num_tokens]``.
         extra_kwargs: Dictionary containing 'positions' (required) and
             optionally 'attention_masks' to be sharded.
         cp_mesh: Device mesh for context parallel dimension
         device: Device for the tensors
         load_balancer_type: Type of load balancer to use for sharding.
-            Options: "headtail", "ptrr", or None. Defaults to "headtail".
+            Options: "headtail", "ptrr", or None. Defaults to "ptrr".
         ptrr_mask_key: When ``load_balancer_type`` is "ptrr" and the attention
             masks are a dict[str, BlockMask], selects which mask the
             PTRRLoadBalancer is built from. Ignored otherwise.
@@ -167,8 +174,8 @@ def cp_shard(
     cp_mesh: DeviceMesh,
     inputs: tuple[torch.Tensor, ...],
     attention_masks: AttentionMasksType | None,
-    load_balancer_type: str | None = "headtail",
-    input_seq_dim: int = 1,
+    load_balancer_type: str | None = "ptrr",
+    input_seq_dim: int = 0,
     ptrr_mask_key: str | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | None]:
     """
@@ -188,18 +195,16 @@ def cp_shard(
             - "headtail": Use HeadTailLoadBalancer (for SDPA)
             - "ptrr": Use PTRRLoadBalancer (for FlexAttention)
             - None: Disable load balancing
-            Defaults to "headtail".
-        input_seq_dim: Sequence dimension index for sharding. Defaults to 1,
-            which covers most use cases where tensors have shape
-            [batch_size, seq_len]. Can be changed by passing a
-            different value if your tensors use a different sequence
-            dimension layout.
+            Defaults to "ptrr".
+        input_seq_dim: Token dimension index for sharding. Defaults to 0 for
+            tensors whose leading dimension is ``num_tokens``. Can be changed
+            by passing a different value if your tensors use a different
+            sequence dimension layout.
         ptrr_mask_key: When ``load_balancer_type`` is "ptrr" and
             ``attention_masks`` is a dict[str, BlockMask], selects which mask in
             the dict the PTRRLoadBalancer is built from. The resulting balancer
             is used to shard every mask in the dict as well as the inputs.
             Required (must be a valid key) in that case; ignored otherwise.
-
     Returns:
         Tuple of (sharded_inputs, attention_masks) where:
             - sharded_inputs: Tuple of input tensors sharded along the

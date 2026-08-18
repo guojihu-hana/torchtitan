@@ -110,7 +110,9 @@ class TestDistGemmAttentionConfig(unittest.TestCase):
                 wqkv_param_init={},
                 wo_param_init={},
                 inner_attention=FlexAttention.Config(),
-                rope=ComplexRoPE.Config(dim=DIM // N_HEADS, max_seq_len=128),
+                rope=ComplexRoPE.Config(
+                    dim=DIM // N_HEADS, max_context_length=128
+                ),
                 fuse_qkv=False,
                 tp_gemm_backend="dist_gemm",
             )

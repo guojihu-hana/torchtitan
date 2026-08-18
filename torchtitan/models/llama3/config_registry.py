@@ -49,8 +49,8 @@ def llama3_debugmodel() -> Trainer.Config:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=8,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+            max_context_length=2048,
             steps=10,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
@@ -200,8 +200,8 @@ def llama3_8b() -> Trainer.Config:
         model_spec=model_spec,
         optimizer=default_adamw(lr=3e-4),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=8192,
+            num_tokens_per_microbatch_per_dp_rank=1 * 8192,
+            max_context_length=8192,
             steps=1000,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
@@ -273,8 +273,8 @@ def llama3_70b() -> Trainer.Config:
         model_spec=model_spec,
         optimizer=default_adamw(lr=1.5e-4),
         training=TrainingConfig(
-            local_batch_size=8,
-            seq_len=8192,
+            num_tokens_per_microbatch_per_dp_rank=8 * 8192,
+            max_context_length=8192,
             steps=1000,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
@@ -326,8 +326,8 @@ def llama3_405b() -> Trainer.Config:
         optimizer=default_adamw(lr=8e-5),
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
         training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=8192,
+            num_tokens_per_microbatch_per_dp_rank=2 * 8192,
+            max_context_length=8192,
             steps=3000,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
@@ -373,8 +373,8 @@ def sft_debugmodel() -> Trainer.Config:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=8,
-            seq_len=2048,
+            num_tokens_per_microbatch_per_dp_rank=8 * 2048,
+            max_context_length=2048,
             steps=10,
         ),
         dataloader=ChatDataLoader.Config(

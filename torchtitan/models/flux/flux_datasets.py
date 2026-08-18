@@ -391,7 +391,8 @@ class FluxDataLoader(ParallelAwareDataloader):
         *,
         dp_world_size: int,
         dp_rank: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         tokenizer: BaseTokenizer | None = None,
         **kwargs,
     ):
@@ -400,6 +401,16 @@ class FluxDataLoader(ParallelAwareDataloader):
             raise ValueError(
                 "FluxDataLoader requires a FluxTokenizerContainer as tokenizer. "
                 "Set tokenizer=FluxTokenizerContainer.Config(...) in your trainer config."
+            )
+
+        num_samples_per_batch, remainder = divmod(
+            num_tokens_per_batch, max_context_length
+        )
+        if remainder or num_samples_per_batch == 0:
+            raise ValueError(
+                "num_tokens_per_batch must be a positive multiple of Flux's "
+                f"fixed sequence length ({max_context_length}), but got "
+                f"{num_tokens_per_batch}."
             )
 
         if config.generate_timesteps:
@@ -431,7 +442,7 @@ class FluxDataLoader(ParallelAwareDataloader):
             "persistent_workers": config.persistent_workers,
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
-            "batch_size": local_batch_size,
+            "batch_size": num_samples_per_batch,
         }
 
         super().__init__(

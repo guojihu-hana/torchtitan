@@ -38,21 +38,21 @@ Workflow overview::
     │  to reduce padding waste                              │
     └───────────────────────────────────────────────────────┘
             │
-            ▼  DataLoader batches samples (batch_size)
+            ▼  Dataset groups whole samples by token budget
     ┌───────────────────────────────────────────────────────┐
     │  Collator  (MultiModalCollator)                    │
     │                                                       │
     │  1. collate_images: for each image Tensor(T,H,W,C),  │
     │     reshape into patches (num_patches, patch_dim),    │
-    │     pad all images to same num_patches                │
-    │     → pixel_values: (N, max_patches, patch_dim)       │
-    │     → grid_thw: (N, 3) per-image [T, H', W'] dims    │
+    |     concatenate all valid patches                     |
+    |     -> pixel_values: (total_patches, patch_dim)       |
+    |     -> grid_thw: (N, 3) per-image [T, H', W'] dims   |
     │     (same for videos)                                 │
     │                                                       │
-    │  2. collate_text: pad input_ids/labels across batch   │
-    │     to seq_len, pad batch to target batch_size        │
-    │     → input_ids: (batch_size, seq_len)                │
-    │     → labels: (batch_size, seq_len)                   │
+    │  2. collate_text: concatenate whole samples and pad   │
+    │     only the unused token-batch tail                  │
+    │     -> input_ids: (num_tokens_per_batch,)             │
+    │     -> labels: (num_tokens_per_batch,)                │
     └───────────────────────────────────────────────────────┘
             │
             ▼
@@ -312,8 +312,8 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         dataset_name: str,
         dataset_path: str | None,
         tokenizer: MultiModalTokenizer,
-        batch_size: int,
-        seq_len: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         patch_size: int,
         temporal_patch_size: int,
         spatial_merge_size: int,
@@ -325,6 +325,7 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         resize_fn: Callable[..., tuple[int, int, int, int]],
         max_patches: int,
         max_patches_per_side: int,
+        max_images_per_batch: int,
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
@@ -349,8 +350,8 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
 
         self._tokenizer = tokenizer
-        self.batch_size = batch_size
-        self.seq_len = seq_len
+        self.max_context_length = max_context_length
+        self.num_tokens_per_batch = num_tokens_per_batch
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
@@ -361,6 +362,7 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         self.resize_fn = resize_fn
         self.max_patches = max_patches
         self.max_patches_per_side = max_patches_per_side
+        self.max_images_per_batch = max_images_per_batch
         self.video_dir = video_dir
         self.video_fps = video_fps
         self.video_min_frames = video_min_frames
@@ -368,13 +370,81 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
         self.enable_packing = packing_buffer_size > 0
         if self.enable_packing:
             self.packer = MMSamplePacker(
-                max_seq_length=seq_len,
+                max_seq_length=max_context_length,
                 buffer_size=packing_buffer_size,
-                batch_size=batch_size,
             )
         self.infinite = infinite
         self._sample_idx = 0
         self._hf_state_restored = False
+        self._batch_samples: list[dict[str, Any]] = []
+        self._num_batch_tokens = 0
+        self._num_batch_images = 0
+
+    def _get_num_vision_entries(self, sample: dict[str, Any]) -> int:
+        num_images = len(sample.get("pixel_values", []))
+        for video in sample.get("pixel_values_videos", []):
+            num_images += video.shape[0] // self.temporal_patch_size
+        return num_images
+
+    def _take_batch(self) -> list[dict[str, Any]]:
+        batch = self._batch_samples
+        self._batch_samples = []
+        self._num_batch_tokens = 0
+        self._num_batch_images = 0
+        return batch
+
+    def _append_to_batch(self, sample: dict[str, Any]):
+        """Add one whole sample and yield completed token-budget batches."""
+        num_sample_tokens = sample["input_ids"].shape[0] - 1
+        if num_sample_tokens <= 0:
+            return
+        if num_sample_tokens > self.max_context_length:
+            logger.warning(
+                "Sample has %d token slots, exceeding max_context_length=%d. Skipping.",
+                num_sample_tokens,
+                self.max_context_length,
+            )
+            return
+        num_sample_images = self._get_num_vision_entries(sample)
+        if num_sample_images > self.max_images_per_batch:
+            logger.warning(
+                "Sample has %d vision entries, exceeding max_images_per_batch=%d. "
+                "Skipping.",
+                num_sample_images,
+                self.max_images_per_batch,
+            )
+            return
+
+        if self._batch_samples and (
+            self._num_batch_tokens + num_sample_tokens > self.num_tokens_per_batch
+            or self._num_batch_images + num_sample_images > self.max_images_per_batch
+        ):
+            batch = self._take_batch()
+            # Record the already-consumed sample as the next batch state before
+            # yielding so a checkpoint taken at the yield boundary cannot lose it.
+            self._batch_samples = [sample]
+            self._num_batch_tokens = num_sample_tokens
+            self._num_batch_images = num_sample_images
+            yield batch
+            if (
+                self._num_batch_tokens == self.num_tokens_per_batch
+                or self._num_batch_images == self.max_images_per_batch
+            ):
+                yield self._take_batch()
+            return
+
+        self._batch_samples.append(sample)
+        self._num_batch_tokens += num_sample_tokens
+        self._num_batch_images += num_sample_images
+        if (
+            self._num_batch_tokens == self.num_tokens_per_batch
+            or self._num_batch_images == self.max_images_per_batch
+        ):
+            yield self._take_batch()
+
+    def _drain_packed_samples(self):
+        while self.packer.packed_samples:
+            yield from self._append_to_batch(self.packer.packed_samples.popleft())
 
     def __iter__(self):
         while True:
@@ -398,41 +468,39 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
                     video_fps=self.video_fps,
                     video_min_frames=self.video_min_frames,
                     video_max_frames=self.video_max_frames,
-                    seq_len=self.seq_len,
+                    seq_len=self.max_context_length,
                 )
                 if processed is None:
                     continue
 
-                if processed["input_ids"].shape[0] > self.seq_len:
+                if processed["input_ids"].shape[0] - 1 > self.max_context_length:
                     logger.warning(
-                        f"Sample length {processed['input_ids'].shape[0]} > training {self.seq_len=}. Skip"
+                        "Sample has %d token slots, exceeding max_context_length=%d. "
+                        "Skipping.",
+                        processed["input_ids"].shape[0] - 1,
+                        self.max_context_length,
                     )
                     continue
 
                 if self.enable_packing:
                     self.packer.add_sample(processed)
-
-                    if self.packer.has_batch_ready():
-                        batch = self.packer.get_next_batch()
-                        if batch:
-                            yield from batch
+                    yield from self._drain_packed_samples()
                 else:
-                    yield processed
+                    yield from self._append_to_batch(processed)
 
             # Flush leftovers in packer when raw samples are exhausted
             if self.enable_packing:
                 self.packer.flush()
-                while self.packer.has_batch_ready():
-                    # pyrefly: ignore [invalid-yield]
-                    yield from self.packer.get_next_batch()
-                # Drain any remainder that doesn't fill a full batch
-                while self.packer.packed_samples:
-                    yield self.packer.packed_samples.popleft()
+                yield from self._drain_packed_samples()
 
             if not self.infinite:
+                if self._batch_samples:
+                    yield self._take_batch()
                 break
             else:
                 self._sample_idx = 0
+                if hasattr(self._data, "set_epoch"):
+                    self._data.set_epoch(self._data.epoch + 1)
 
     def _get_data_iter(self):
         # TODO: add epoch counter and per-epoch reshuffling (see text_datasets.py)
@@ -462,23 +530,34 @@ class HuggingFaceMultiModalDataset(IterableDataset, Stateful):
 
     def load_state_dict(self, state_dict):
         self._sample_idx = state_dict["sample_idx"]
+        self._batch_samples = state_dict.get("batch_samples", [])
+        self._num_batch_tokens = sum(
+            sample["input_ids"].shape[0] - 1 for sample in self._batch_samples
+        )
+        self._num_batch_images = sum(
+            self._get_num_vision_entries(sample) for sample in self._batch_samples
+        )
 
         # Restore HF dataset state if available, enabling fast resume
         if "hf_dataset_state" in state_dict and hasattr(self._data, "load_state_dict"):
-            self._data.load_state_dict(state_dict["hf_dataset_state"])
+            data_state = state_dict["hf_dataset_state"]
+            if hasattr(self._data, "set_epoch"):
+                self._data.set_epoch(data_state.get("epoch", 0))
+            self._data.load_state_dict(data_state)
             self._hf_state_restored = True
 
         if self.enable_packing and "packer_state" in state_dict:
             packer_state = state_dict["packer_state"]
-            self.packer._sample_buffer = {
-                i: s for i, s in enumerate(packer_state["sample_buffer"])
-            }
+            self.packer._sample_buffer = dict(enumerate(packer_state["sample_buffer"]))
             self.packer._next_id = len(packer_state["sample_buffer"])
             self.packer.packed_samples.clear()
             self.packer.packed_samples.extend(packer_state["packed_samples"])
 
     def state_dict(self):
-        state = {"sample_idx": self._sample_idx}
+        state = {
+            "sample_idx": self._sample_idx,
+            "batch_samples": self._batch_samples,
+        }
 
         # Save HF dataset state for fast resume if supported
         if hasattr(self._data, "state_dict"):
@@ -581,16 +660,21 @@ class MMDataLoader(ParallelAwareDataloader):
         dp_world_size: int,
         dp_rank: int,
         tokenizer: MultiModalTokenizer,
-        seq_len: int,
-        local_batch_size: int,
+        max_context_length: int,
+        num_tokens_per_batch: int,
         **kwargs,
     ):
+        if num_tokens_per_batch < max_context_length:
+            raise ValueError(
+                "num_tokens_per_batch must be greater than or equal to "
+                "max_context_length so an accepted multimodal sample fits in one batch."
+            )
         dataset = HuggingFaceMultiModalDataset(
             dataset_name=config.dataset,
             dataset_path=config.dataset_path,
             tokenizer=tokenizer,
-            batch_size=local_batch_size,
-            seq_len=seq_len,
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
             spatial_merge_size=config.spatial_merge_size,
@@ -602,6 +686,7 @@ class MMDataLoader(ParallelAwareDataloader):
             resize_fn=config.resize_fn,
             max_patches=config.max_patches,
             max_patches_per_side=config.max_patches_per_side,
+            max_images_per_batch=config.max_images_per_batch,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
@@ -613,9 +698,8 @@ class MMDataLoader(ParallelAwareDataloader):
         )
 
         collate_fn = MultiModalCollator(
-            batch_size=local_batch_size,
-            seq_len=seq_len,
-            max_images_per_batch=config.max_images_per_batch,
+            num_tokens_per_batch=num_tokens_per_batch,
+            max_context_length=max_context_length,
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
             spatial_merge_size=config.spatial_merge_size,
@@ -629,7 +713,7 @@ class MMDataLoader(ParallelAwareDataloader):
             "persistent_workers": config.persistent_workers,
             "pin_memory": config.pin_memory,
             "prefetch_factor": config.prefetch_factor,
-            "batch_size": local_batch_size,
+            "batch_size": None,
             "collate_fn": collate_fn,
         }
 

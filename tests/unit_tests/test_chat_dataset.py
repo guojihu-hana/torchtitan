@@ -63,7 +63,8 @@ class TestChatDatasetLabelMasking(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=False,
         )
 
@@ -96,7 +97,8 @@ class TestChatDatasetShiftedTokens(unittest.TestCase):
             dataset=_load_dataset(),
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=False,
         )
 
@@ -153,7 +155,8 @@ class TestChatDatasetGreedyPacking(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=seq_len,
+            max_context_length=seq_len,
+            num_tokens_per_batch=seq_len,
             infinite=False,
         )
 
@@ -181,7 +184,8 @@ class TestChatDatasetPerDocumentPositions(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=seq_len,
+            max_context_length=seq_len,
+            num_tokens_per_batch=seq_len,
             infinite=False,
         )
 
@@ -222,7 +226,8 @@ class TestChatDatasetDropOnOverflow(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=32,
+            max_context_length=32,
+            num_tokens_per_batch=32,
             infinite=False,
         )
 
@@ -247,7 +252,8 @@ class TestChatDatasetMessageValidation(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=bad_processor,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=False,
         )
 
@@ -268,7 +274,8 @@ class TestChatDatasetMessageValidation(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=bad_processor,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=False,
         )
 
@@ -290,7 +297,8 @@ class TestChatDatasetMessageValidation(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=bad_processor,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=False,
         )
 
@@ -309,7 +317,8 @@ class TestChatDatasetCheckpointing(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=seq_len,
+            max_context_length=seq_len,
+            num_tokens_per_batch=seq_len,
             infinite=False,
         )
 
@@ -333,7 +342,8 @@ class TestChatDatasetCheckpointing(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=seq_len,
+            max_context_length=seq_len,
+            num_tokens_per_batch=seq_len,
             infinite=False,
         )
         chat_ds_resumed.load_state_dict(state)
@@ -366,8 +376,8 @@ class TestChatDatasetCheckpointing(unittest.TestCase):
                 dp_world_size=world_size,
                 dp_rank=rank,
                 tokenizer=tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
-                seq_len=seq_len,
-                local_batch_size=batch_size,
+                max_context_length=seq_len,
+                num_tokens_per_batch=batch_size * seq_len,
             )
 
         for streaming in [True, False]:
@@ -413,6 +423,33 @@ class TestChatDatasetCheckpointing(unittest.TestCase):
                         )
 
 
+class TestChatDataLoaderPackedTokens(unittest.TestCase):
+    def test_returns_one_flat_token_batch(self):
+        max_context_length = 128
+        num_tokens_per_batch = 256
+        config = ChatDataLoader.Config(
+            dataset_path="json",
+            load_dataset_kwargs={"data_files": _DATA_PATH, "split": "train"},
+            sample_processor=_process_sample,
+            infinite=False,
+        )
+
+        dataloader = config.build(
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=_load_tokenizer(),
+            max_context_length=max_context_length,
+            num_tokens_per_batch=num_tokens_per_batch,
+        )
+        input_dict, labels = next(iter(dataloader))
+
+        self.assertIsNone(dataloader.batch_size)
+        self.assertEqual(input_dict["input"].shape, (num_tokens_per_batch,))
+        self.assertEqual(input_dict["positions"].shape, (num_tokens_per_batch,))
+        self.assertEqual(labels.shape, (num_tokens_per_batch,))
+        self.assertEqual(input_dict["positions"][0].item(), 0)
+
+
 class TestChatDatasetInfiniteLooping(unittest.TestCase):
     """Dataset re-shuffles and continues after exhausting data."""
 
@@ -423,7 +460,8 @@ class TestChatDatasetInfiniteLooping(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=True,
         )
 
@@ -443,7 +481,8 @@ class TestChatDatasetInfiniteLooping(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=seq_len,
+            max_context_length=seq_len,
+            num_tokens_per_batch=seq_len,
             infinite=True,
         )
 
@@ -464,7 +503,8 @@ class TestDocumentMaskBlocksCrossDocAttention(unittest.TestCase):
             dataset=ds,
             tokenizer=tokenizer,
             sample_processor=_process_sample,
-            seq_len=2048,
+            max_context_length=2048,
+            num_tokens_per_batch=2048,
             infinite=False,
         )
 
@@ -478,7 +518,7 @@ class TestDocumentMaskBlocksCrossDocAttention(unittest.TestCase):
         packed = input_ids_0 + input_ids_1
         boundary = len(input_ids_0)
         positions = torch.tensor(
-            [list(range(len(input_ids_0))) + list(range(len(input_ids_1)))]
+            list(range(len(input_ids_0))) + list(range(len(input_ids_1)))
         )
 
         mask_mod = get_document_mask_mod(positions)
@@ -501,13 +541,8 @@ class TestDocumentMaskBlocksCrossDocAttention(unittest.TestCase):
 
     def test_packed_document_mask_composes_with_causal_mask(self):
         for positions in (
-            torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]]),
-            torch.tensor(
-                [
-                    [0, 1, 2, 0, 1, 0, 1, 2],
-                    [0, 1, 0, 1, 2, 3, 0, 1],
-                ]
-            ),
+            torch.tensor([0, 1, 2, 0, 1, 0, 1, 2]),
+            torch.tensor([0, 1, 0, 1, 2, 3, 0, 1]),
         ):
             causal_mask = get_causal_mask_mod()
             document_mask = get_document_mask_mod(positions)
@@ -517,26 +552,22 @@ class TestDocumentMaskBlocksCrossDocAttention(unittest.TestCase):
             )
             h = torch.tensor(0)
 
-            for b in range(positions.shape[0]):
-                b_tensor = torch.tensor(b)
-                for q_idx in range(positions.shape[1]):
-                    q_tensor = torch.tensor(q_idx)
-                    for kv_idx in range(positions.shape[1]):
-                        kv_tensor = torch.tensor(kv_idx)
-                        expected = causal_mask(
-                            b_tensor, h, q_tensor, kv_tensor
-                        ) & document_mask(b_tensor, h, q_tensor, kv_tensor)
-                        self.assertEqual(
-                            packed_mask(b_tensor, h, q_tensor, kv_tensor).item(),
-                            expected.item(),
-                        )
+            b = torch.tensor(0)
+            for q_idx in range(positions.shape[0]):
+                q_tensor = torch.tensor(q_idx)
+                for kv_idx in range(positions.shape[0]):
+                    kv_tensor = torch.tensor(kv_idx)
+                    expected = causal_mask(b, h, q_tensor, kv_tensor) & document_mask(
+                        b, h, q_tensor, kv_tensor
+                    )
+                    self.assertEqual(
+                        packed_mask(b, h, q_tensor, kv_tensor).item(),
+                        expected.item(),
+                    )
 
     def test_decoder_block_causal_flex_mask_supports_multiple_samples(self):
         positions = torch.tensor(
-            [
-                [0, 1, 2, 0, 1, 0, 1, 2],
-                [0, 1, 0, 1, 2, 3, 0, 1],
-            ],
+            [0, 1, 2, 0, 1, 0, 1, 2],
             dtype=torch.int32,
         )
         attn_config = BaseAttention.Config(
@@ -547,7 +578,7 @@ class TestDocumentMaskBlocksCrossDocAttention(unittest.TestCase):
         decoder = Decoder.__new__(Decoder)
         mask = decoder._create_flex_attention_mask_for_document(positions, attn_config)
 
-        self.assertEqual(mask.shape, (positions.shape[0], 1, 8, 8))
+        self.assertEqual(mask.shape, (1, 1, 8, 8))
 
 
 class TestInterleavedChatDataLoader(unittest.TestCase):
@@ -585,8 +616,8 @@ class TestInterleavedChatDataLoader(unittest.TestCase):
             dp_world_size=world_size,
             dp_rank=rank,
             tokenizer=tokenizer_config.build(tokenizer_path=_TOKENIZER_PATH),
-            seq_len=seq_len,
-            local_batch_size=batch_size,
+            max_context_length=seq_len,
+            num_tokens_per_batch=batch_size * seq_len,
         )
 
     def test_rejects_empty_sources(self):
@@ -626,7 +657,7 @@ class TestInterleavedChatDataLoader(unittest.TestCase):
     def test_construction_batch_size_and_num_workers(self):
         config = self._make_config(num_workers=2)
         dl = self._build_dataloader(config, batch_size=4)
-        self.assertEqual(dl.batch_size, 4)
+        self.assertIsNone(dl.batch_size)
         self.assertEqual(dl.num_workers, 2)
 
     def test_yields_input_positions_and_labels(self):
@@ -637,21 +668,21 @@ class TestInterleavedChatDataLoader(unittest.TestCase):
         batch_input, batch_label = next(iter(dl))
         self.assertIn("input", batch_input)
         self.assertIn("positions", batch_input)
-        self.assertEqual(batch_input["input"].shape, (2, seq_len))
-        self.assertEqual(batch_input["positions"].shape, (2, seq_len))
-        self.assertEqual(batch_label.shape, (2, seq_len))
+        self.assertEqual(batch_input["input"].shape, (2 * seq_len,))
+        self.assertEqual(batch_input["positions"].shape, (2 * seq_len,))
+        self.assertEqual(batch_label.shape, (2 * seq_len,))
 
     def test_resumption_mid_epoch(self):
         """Checkpoint taken before any source exhausts resumes correctly."""
         config = self._make_config()
-        dl = self._build_dataloader(config)
+        dl = self._build_dataloader(config, batch_size=4)
         it = iter(dl)
 
         for _ in range(5):
             next(it)
         state = deepcopy(dl.state_dict())
 
-        dl_resumed = self._build_dataloader(self._make_config())
+        dl_resumed = self._build_dataloader(self._make_config(), batch_size=4)
         dl_resumed.load_state_dict(state)
         it_resumed = iter(dl_resumed)
 
