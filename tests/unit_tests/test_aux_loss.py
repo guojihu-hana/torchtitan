@@ -16,7 +16,11 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.models.common.aux_loss import collect_aux_loss_metrics, LoggedAuxLoss
+from torchtitan.models.common.aux_loss import (
+    collect_aux_loss_metrics,
+    LoggedAuxLoss,
+    zero_aux_losses,
+)
 from torchtitan.models.common.moe import SeqwiseLoadBalanceLoss
 
 
@@ -43,15 +47,26 @@ def _reference_seqwise_aux_loss(
 
 
 def _make_loss_module(top_k: int, coeff: float, per_step_denominator: int):
-    loss = SeqwiseLoadBalanceLoss(
-        SeqwiseLoadBalanceLoss.Config(
-            coeff=coeff,
-            top_k=top_k,
-            per_step_denominator=per_step_denominator,
-        )
-    )
+    # ``per_step_denominator`` is framework-set (not an init field): the
+    # decoder's ``update_from_config`` fills it before modules are built.
+    cfg = SeqwiseLoadBalanceLoss.Config(coeff=coeff, top_k=top_k)
+    cfg.per_step_denominator = per_step_denominator
+    loss = SeqwiseLoadBalanceLoss(cfg)
     loss.train()
     return loss
+
+
+def _seqwise_loss_config(top_k: int, per_step_denominator: int, *, enable_ep: bool):
+    """Build a SeqwiseLoadBalanceLoss config with the framework-set fields."""
+    from torchtitan.models.common.moe_sharding import _seqwise_counts_sharding_config
+
+    cfg = SeqwiseLoadBalanceLoss.Config(
+        coeff=0.1,
+        top_k=top_k,
+        counts_sharding_config=_seqwise_counts_sharding_config(enable_ep=enable_ep),
+    )
+    cfg.per_step_denominator = per_step_denominator
+    return cfg
 
 
 def _set_spmd_types_backend():
@@ -198,10 +213,10 @@ class TestLoggedAuxLossAccumulation(unittest.TestCase):
             carrier = torch.rand(4, 6, requires_grad=True)
             out = loss.inject(torch.tensor(10.0), carrier=carrier)
             out.sum().backward()
-        LoggedAuxLoss.zero_all([loss1, loss2])
+        zero_aux_losses([loss1, loss2])
         self.assertEqual(loss1._acc_sum.item(), 0.0)
         self.assertEqual(loss2._acc_sum.item(), 0.0)
-        key = ("batch", "seqwise_load_balance_loss")
+        key = ("sequence", "seqwise_load_balance_loss")
         # 2 modules x (10 / 100) = 0.2
         self.assertAlmostEqual(LoggedAuxLoss._step_snapshots[key].item(), 0.2)
 
@@ -306,7 +321,7 @@ class TestAuxLossMetricsCollection(DTensorTestBase):
                 torch.nn.ModuleList([loss1]),
                 torch.nn.ModuleList([loss2]),
             ]
-            LoggedAuxLoss.zero_all(model_parts)
+            zero_aux_losses(model_parts)
 
             metrics = collect_aux_loss_metrics(model_parts, parallel_dims)
             key = "seqwise_load_balance_loss/mean"
@@ -341,13 +356,7 @@ class TestSeqwiseLoadBalanceLossBackendGuard(unittest.TestCase):
 
         set_spmd_backend("default")
         with self.assertRaises(ValueError):
-            SeqwiseLoadBalanceLoss(
-                SeqwiseLoadBalanceLoss.Config(
-                    coeff=0.1,
-                    top_k=2,
-                    per_step_denominator=100,
-                )
-            )
+            _make_loss_module(2, 0.1, 100)
         set_spmd_backend("spmd_types")
         # Sanity: construction succeeds under spmd_types.
         _make_loss_module(2, 0.1, 100)
@@ -355,21 +364,30 @@ class TestSeqwiseLoadBalanceLossBackendGuard(unittest.TestCase):
         _clear_aux_loss_registry()
 
 
-class TestLoggedAuxLossUpdateConfig(unittest.TestCase):
-    def test_update_from_config_sets_denominator_per_mode(self):
-        """The normalization mode maps to its per-step denominator."""
-        for normalize, expected in [
-            ("tokens", 16 * 2048),
-            ("sequences", 16),
-            ("batch", 1),
-        ]:
-            cfg = SeqwiseLoadBalanceLoss.Config(
-                coeff=0.1,
-                top_k=2,
-                normalize=normalize,
-            )
-            LoggedAuxLoss.update_from_config(cfg, global_batch_size=16, seq_len=2048)
-            self.assertEqual(cfg.per_step_denominator, expected)
+class TestLoggedAuxLossConfig(unittest.TestCase):
+    def setUp(self):
+        _set_spmd_types_backend()
+
+    def tearDown(self):
+        _restore_default_backend()
+        _clear_aux_loss_registry()
+
+    def test_per_step_denominator_is_framework_set_not_init_field(self):
+        """The denominator is filled after config construction (decoder's
+        ``update_from_config``) and survives ``build()``'s replace."""
+        cfg = SeqwiseLoadBalanceLoss.Config(coeff=0.1, top_k=2)
+        cfg.per_step_denominator = 16
+        built = cfg.build()
+        self.assertEqual(built.per_step_denominator, 16)
+
+    def test_aggregation_level_must_be_sequence(self):
+        """Sequence-wise aggregation is this loss's fixed semantics."""
+        cfg = SeqwiseLoadBalanceLoss.Config(
+            coeff=0.1, top_k=2, aggregation_level="batch"
+        )
+        cfg.per_step_denominator = 1
+        with self.assertRaises(ValueError):
+            SeqwiseLoadBalanceLoss(cfg)
 
 
 class TestSeqwiseCountsSpmdTypes(DTensorTestBase):
@@ -402,9 +420,6 @@ class TestSeqwiseCountsSpmdTypes(DTensorTestBase):
             dense_sequence_parallel_placement,
         )
         from torchtitan.models.common.moe import SeqwiseLoadBalanceLoss
-        from torchtitan.models.common.moe_sharding import (
-            _seqwise_counts_sharding_config,
-        )
 
         set_spmd_backend("spmd_types")
         with patch("torchtitan.distributed.parallel_dims.device_type", "cpu"):
@@ -461,16 +476,7 @@ class TestSeqwiseCountsSpmdTypes(DTensorTestBase):
                 router_out_layout.partition_spec,
             )
 
-            loss = SeqwiseLoadBalanceLoss(
-                SeqwiseLoadBalanceLoss.Config(
-                    coeff=0.1,
-                    top_k=K,
-                    per_step_denominator=B,
-                    counts_sharding_config=_seqwise_counts_sharding_config(
-                        enable_ep=True
-                    ),
-                )
-            )
+            loss = SeqwiseLoadBalanceLoss(_seqwise_loss_config(K, B, enable_ep=True))
             loss.parallelize(parallel_dims)
 
             local_scores.requires_grad_(True)
@@ -485,14 +491,7 @@ class TestSeqwiseCountsSpmdTypes(DTensorTestBase):
             # Backward for the gradient check: a fresh module so the step
             # accumulator only covers the first forward.
             loss_grad = SeqwiseLoadBalanceLoss(
-                SeqwiseLoadBalanceLoss.Config(
-                    coeff=0.1,
-                    top_k=K,
-                    per_step_denominator=B,
-                    counts_sharding_config=_seqwise_counts_sharding_config(
-                        enable_ep=True
-                    ),
-                )
+                _seqwise_loss_config(K, B, enable_ep=True)
             )
             loss_grad.parallelize(parallel_dims)
             carrier_g = local_scores.gather(dim=-1, index=local_ids)

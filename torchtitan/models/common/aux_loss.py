@@ -18,13 +18,10 @@ Framework contract
 
 - The normalization is the framework's job: ``inject`` scales every value by
   ``1 / per_step_denominator``, so both the injected gradient and the logged
-  metric follow the loss's ``normalize`` mode. The denominator is set per
-  loss by ``LoggedAuxLoss.update_from_config`` (called by the decoder's
-  ``update_from_config``) from the training batch size and sequence length:
-  - ``"tokens"`` (default): denominator = ``global_batch_size * seq_len`` --
-    a mean over the global batch's tokens. Loss forwards produce raw sums
-    and must not normalize by sequence length of any kind.
-  - ``"sequences"``: denominator = ``global_batch_size`` -- a mean over the
+  metric follow the loss's ``aggregation_level``. The denominator is set per
+  loss by the decoder's ``update_from_config`` from the training batch size
+  and sequence length:
+  - ``"sequence"``: denominator = ``global_batch_size`` -- a mean over the
     batch's sequences (e.g. the DS-V3 sequence-wise load-balance loss, whose
     per-sequence value is already token-count-normalized inside Eqs 18/20).
   - ``"batch"``: denominator = 1 -- the loss is an O(1) global-batch
@@ -34,19 +31,22 @@ Framework contract
     validate against those configs (see PR #3000).
 - The metric accumulates in the autograd backward (once per microbatch by
   autograd semantics; activation-checkpoint recompute never double counts),
-  so it is available after ``backward``; ``zero_all`` snapshots it at the
-  optimizer step pre-hook.
-- ``reduce_mesh`` names the mesh the metric is reduced over:
-  sequence-statistics losses (seqwise load balance) are identical across CP
-  and choose ``batch``; slice-additive losses (per-token penalties, e.g.
-  DSA indexer KL) are partials over DP and CP and choose ``"loss"``.
+  so it is available after ``backward``; ``zero_aux_losses`` snapshots it at
+  the optimizer step pre-hook.
+- The metric is always sum-reduced over the batch (DP) mesh and the PP mesh
+  before logging: both supported aggregation levels yield batch-complete
+  statistics that are identical across the sequence and CP axes, so no
+  per-loss mesh choice is exposed. TODO: per-token, slice-additive losses
+  (e.g. a future DSA indexer KL) are partials over DP and CP and will need a
+  ``"token"`` aggregation level that reduces over the loss mesh; add it when
+  such a consumer lands.
 - Model specs must register ``register_aux_loss_zero_hook`` after building
   the optimizer (see e.g. the DeepSeek-V3 model registry).
 """
 
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
 import spmd_types as spmd
@@ -62,6 +62,7 @@ from torchtitan.tools.utils import device_type
 
 __all__ = [
     "LoggedAuxLoss",
+    "zero_aux_losses",
     "collect_aux_loss_metrics",
     "register_aux_loss_zero_hook",
 ]
@@ -78,7 +79,7 @@ class _AuxLossInjection(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
+    def forward(
         ctx,
         carrier: torch.Tensor,
         aux_loss: torch.Tensor,
@@ -120,9 +121,10 @@ class LoggedAuxLoss(Module):
     """Inject auxiliary gradients and defer metric readout to the step hook.
 
     Subclasses call ``inject()`` each microbatch to inject the gradient; the
-    metric value accumulates in the autograd backward. ``zero_all`` snapshots
-    the accumulators into ``_step_snapshots`` and clears them, at the
-    optimizer step pre-hook; metric collection later reduces the snapshots.
+    metric value accumulates in the autograd backward. ``zero_aux_losses``
+    snapshots the accumulators into ``_step_snapshots`` and clears them, at
+    the optimizer step pre-hook; metric collection later reduces the
+    snapshots.
     """
 
     # Precompute *identical* metric groups on all pipeline stages. Populated
@@ -130,52 +132,35 @@ class LoggedAuxLoss(Module):
     # in the collectives with pre-allocated zero accumulators.
     _group_counts: ClassVar[dict[tuple[str, str], int]] = defaultdict(int)
 
-    # Step snapshots keyed by ``(reduce_mesh, metric_name)``, filled by
-    # ``zero_all`` at each optimizer step pre-hook.
+    # Step snapshots keyed by ``(aggregation_level, metric_name)``, filled by
+    # ``zero_aux_losses`` at each optimizer step pre-hook.
     _step_snapshots: ClassVar[dict[tuple[str, str], torch.Tensor]] = {}
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         coeff: float
         """Aux loss coefficient. Scales the gradient contribution."""
-        reduce_mesh: str = "loss"
-        """Mesh the metric is ``sum``-reduced over (see module docstring for
-        the ownership contract). ``"batch"`` for full-sequence-statistics
-        losses, ``"loss"`` for slice-additive ones. PP is reduced separately.
+        aggregation_level: Literal["sequence", "batch"]
+        """Aggregation level of the loss over the global batch -- whether a
+        loss value is produced per sequence (``"sequence"``) or per global
+        batch (``"batch"``); see the module docstring's framework contract.
+        The matching ``per_step_denominator`` is set by the decoder's
+        ``update_from_config`` before the modules are built.
         """
-        normalize: Literal["tokens", "sequences", "batch"] = "tokens"
-        """Normalization mode for the injected gradient and logged metric;
-        see the module docstring's framework contract. The matching
-        ``per_step_denominator`` is set by ``update_from_config``.
-        """
-        per_step_denominator: int = -1
-        """Denominator of the per-step normalization (tokens per step for
-        ``"tokens"``, sequences per step for ``"sequences"``, 1 for
-        ``"batch"``), set by ``LoggedAuxLoss.update_from_config`` before the
-        modules are built.
+        per_step_denominator: int = field(init=False, default=-1)
+        """Denominator of the per-step normalization (sequences per step for
+        ``"sequence"``, 1 for ``"batch"``). Framework-set, not user config:
+        the decoder's ``update_from_config`` fills it before the modules are
+        built. ``Config.build`` copies it over explicitly because
+        ``dataclasses.replace`` drops ``init=False`` fields.
         """
 
-    @classmethod
-    def update_from_config(
-        cls,
-        aux_loss_cfg: "Config",
-        *,
-        global_batch_size: int,
-        seq_len: int,
-    ) -> None:
-        """Set the per-step normalization denominator from the training config.
-
-        Maps the ``normalize`` mode to its denominator:
-        ``"tokens"`` -> ``global_batch_size * seq_len`` (per-token mean),
-        ``"sequences"`` -> ``global_batch_size`` (per-sequence mean),
-        ``"batch"`` -> 1 (global-batch statistic). Called by the decoder's
-        ``update_from_config`` for every aux-loss config in the model tree.
-        """
-        aux_loss_cfg.per_step_denominator = {
-            "tokens": global_batch_size * seq_len,
-            "sequences": global_batch_size,
-            "batch": 1,
-        }[aux_loss_cfg.normalize]
+        def build(self, **kwargs):
+            # Module.Config.build() uses dataclasses.replace() internally,
+            # which would drop the framework-set denominator; carry it over.
+            instance = super().build(**kwargs)
+            instance.per_step_denominator = self.per_step_denominator
+            return instance
 
     @property
     def metric_name(self) -> str:
@@ -189,13 +174,13 @@ class LoggedAuxLoss(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.coeff = config.coeff
-        self.reduce_mesh = config.reduce_mesh
+        self.aggregation_level = config.aggregation_level
         self.per_step_denominator = config.per_step_denominator
         # Running sum of the scaled per-microbatch values, covering one step.
         self.register_buffer(
             "_acc_sum", torch.zeros((), dtype=torch.float32), persistent=False
         )
-        LoggedAuxLoss._group_counts[(config.reduce_mesh, self.metric_name)] += 1
+        LoggedAuxLoss._group_counts[(config.aggregation_level, self.metric_name)] += 1
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is None:
@@ -211,8 +196,8 @@ class LoggedAuxLoss(Module):
         identity forward returns it unchanged, and its graph carries the
         aux-loss gradient on backward. ``raw_sum`` is the loss's raw sum over
         the local batch; the framework applies the normalization (see
-        ``normalize`` / ``per_step_denominator``) and accumulates the metric
-        in the backward (see ``_AuxLossInjection``).
+        ``aggregation_level`` / ``per_step_denominator``) and accumulates the
+        metric in the backward (see ``_AuxLossInjection``).
         """
         assert self.per_step_denominator > 0
         scale = 1.0 / self.per_step_denominator
@@ -224,43 +209,48 @@ class LoggedAuxLoss(Module):
             carrier, raw_sum * (self.coeff * scale), acc_value, self
         )
 
-    @classmethod
-    def zero_all(cls, model_parts) -> None:
-        """Snapshot all accumulators for the current step, then clear them.
 
-        Runs at the optimizer step pre-hook, so the snapshot covers every
-        microbatch of the step. ``clear()`` resets the snapshot per step;
-        ``add_`` accumulates every module of the group exactly once. Walking
-        ``part.modules()`` (instead of only ``part.layers``) also covers aux
-        losses living outside the main decoder layers, e.g. MTP modules.
-        """
-        cls._step_snapshots.clear()
-        for part in model_parts:
-            for module in part.modules():
-                if isinstance(module, LoggedAuxLoss):
-                    key = (module.reduce_mesh, module.metric_name)
-                    if key not in cls._step_snapshots:
-                        cls._step_snapshots[key] = torch.zeros_like(module._acc_sum)
-                    cls._step_snapshots[key] += module._acc_sum
-                    module._acc_sum.zero_()
+def zero_aux_losses(model_parts) -> None:
+    """Snapshot all accumulators for the current step, then clear them.
+
+    Runs at the optimizer step pre-hook, so the snapshot covers every
+    microbatch of the step. ``_step_snapshots.clear()`` resets the snapshot
+    per step; ``add_`` accumulates every module of the group exactly once.
+    Walking ``part.modules()`` (instead of only ``part.layers``) also covers
+    aux losses living outside the main decoder layers, e.g. MTP modules.
+    """
+    LoggedAuxLoss._step_snapshots.clear()
+    for part in model_parts:
+        for module in part.modules():
+            if isinstance(module, LoggedAuxLoss):
+                key = (module.aggregation_level, module.metric_name)
+                if key not in LoggedAuxLoss._step_snapshots:
+                    LoggedAuxLoss._step_snapshots[key] = torch.zeros_like(
+                        module._acc_sum
+                    )
+                LoggedAuxLoss._step_snapshots[key] += module._acc_sum
+                module._acc_sum.zero_()
 
 
 def collect_aux_loss_metrics(model_parts, parallel_dims) -> dict[str, float]:
-    """Reduce auxiliary-loss metrics across configured meshes.
+    """Reduce auxiliary-loss metrics across the batch and PP meshes.
 
     Returns ``{metric_name}/mean`` per group (mean over the global batch's
-    tokens, sequences, or batch depending on the loss's ``normalize`` mode,
-    per module); ``{}`` when no aux losses are configured. Called on all
-    ranks at log time, so the collectives are safe.
+    sequences or batches depending on the loss's ``aggregation_level``, per
+    module); ``{}`` when no aux losses are configured. Called on all ranks
+    at log time, so the collectives are safe.
 
-    Note: the snapshots are taken per optimizer step (see ``zero_all``), so
-    the reported value is the last completed step, not an average over the
+    Note: the snapshots are taken per optimizer step (see ``zero_aux_losses``),
+    so the reported value is the last completed step, not an average over the
     ``log_freq`` window.
+
+    TODO: replace with the GPU tensor logging effort.
     """
     if not LoggedAuxLoss._group_counts:
         return {}
 
     pp_mesh = parallel_dims.get_optional_mesh("pp")
+    batch_mesh = parallel_dims.get_optional_mesh("batch")
     local_sums = {
         key: LoggedAuxLoss._step_snapshots.get(
             key, torch.zeros((), dtype=torch.float32, device=device_type)
@@ -269,11 +259,12 @@ def collect_aux_loss_metrics(model_parts, parallel_dims) -> dict[str, float]:
     }
     metrics = {}
     for key, total in sorted(local_sums.items()):
-        mesh_name, tag = key
-        for mesh in (parallel_dims.get_optional_mesh(mesh_name), pp_mesh):
+        for mesh in (batch_mesh, pp_mesh):
             if mesh is not None:
                 total = all_reduce(total, reduceOp="sum", group=mesh)
-        metrics[f"{tag}/mean"] = float(total.item()) / LoggedAuxLoss._group_counts[key]
+        metrics[f"{key[1]}/mean"] = (
+            float(total.item()) / LoggedAuxLoss._group_counts[key]
+        )
     return metrics
 
 
@@ -288,5 +279,5 @@ def register_aux_loss_zero_hook(
     accumulator management happens outside the model, once per training step.
     """
     optimizers.register_step_pre_hook(
-        lambda *args, **kwargs: LoggedAuxLoss.zero_all(model_parts)
+        lambda *args, **kwargs: zero_aux_losses(model_parts)
     )

@@ -32,7 +32,6 @@ from torchtitan.models.common.token_dispatcher import update_ep_token_dispatcher
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
-
 __all__ = ["Decoder", "TransformerBlock"]
 
 
@@ -187,14 +186,15 @@ class Decoder(BaseModel):
 
                 # Runtime config fields for aux losses: the per-step
                 # normalization denominator, set before the modules are built.
-                # The mode -> denominator mapping lives on the loss class.
                 for _fqn, aux_loss_cfg, _parent, _attr in self.traverse(
                     LoggedAuxLoss.Config
                 ):
-                    LoggedAuxLoss.update_from_config(
-                        aux_loss_cfg,  # pyrefly: ignore [bad-argument-type]
-                        global_batch_size=config.training.global_batch_size,
-                        seq_len=config.training.seq_len,
+                    # pyrefly: ignore [missing-attribute]
+                    aux_loss_cfg.per_step_denominator = (
+                        config.training.global_batch_size
+                        # pyrefly: ignore [missing-attribute]
+                        if aux_loss_cfg.aggregation_level == "sequence"
+                        else 1  # "batch": O(1) global-batch statistic
                     )
 
     # Set by the trainer when ChunkedLossWrapper is used, so lm_head is applied

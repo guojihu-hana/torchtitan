@@ -361,6 +361,14 @@ class _SeqwiseCounts(Module):
     The output concatenates the two ``(B, E)`` tensors into one ``(B, 2E)``
     tensor because the config-based redistribution layer only supports
     single-tensor outputs.
+
+    The counts live in a child module (rather than inline in
+    ``SeqwiseLoadBalanceLoss.forward``) because ``ShardingConfig``
+    redistributions are attached to module boundaries: the spmd_types
+    runtime applies them when crossing into and out of a module, so the
+    Partial -> Invariant all-reduce above has to be this child's output
+    boundary. An explicit collective inside the parent's forward code would
+    bypass that mechanism and break the typechecker's view of the graph.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -401,22 +409,21 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
     Formula-internal ``1/T`` (Eqs 18/20) is per-sequence and derived from the
     all-reduced counts (``num_tokens_B``), so it stays CP-correct and
     varlen-safe regardless of the local tensor shape. The framework
-    normalizes by ``per_step_denominator = global_batch_size`` (``normalize =
-    "sequences"``), i.e. the loss is a mean over the batch's sequences -- the
-    DS-V3 Eq 17 convention -- so ``coeff`` directly sets the aux:CE gradient
-    ratio (a per-token normalization would weaken it by the sequence length).
+    normalizes by ``per_step_denominator = global_batch_size``
+    (``aggregation_level = "sequence"``), i.e. the loss is a mean over the
+    batch's sequences -- the DS-V3 Eq 17 convention -- so ``coeff`` directly
+    sets the aux:CE gradient ratio (a per-token normalization would weaken it
+    by the sequence length).
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(LoggedAuxLoss.Config):
         top_k: int
-        # "batch" is this loss's disjoint-ownership mesh: ``_SeqwiseCounts``
-        # all-reduces across the token-partition group, and the metric is
-        # summed over the DP mesh at collection time.
-        reduce_mesh: str = "batch"
-        # Mean over sequences, not tokens: each sequence's loss is already
-        # token-count-normalized inside Eqs 18/20.
-        normalize: Literal["tokens", "sequences", "batch"] = "sequences"
+        # Sequence-wise aggregation is this loss's fixed semantics: the
+        # per-sequence value is already token-count-normalized inside
+        # Eqs 18/20, so the framework normalizes by the global batch size in
+        # sequences (asserted in ``__init__``).
+        aggregation_level: Literal["sequence", "batch"] = "sequence"
         # Boundary sharding config for ``_SeqwiseCounts``: the Partial ->
         # Invariant all-reduce over the token-partition axes (CP, and TP when
         # EP shards tokens over the TP axis) lands at the child's output
@@ -428,6 +435,12 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        if config.aggregation_level != "sequence":
+            raise ValueError(
+                "SeqwiseLoadBalanceLoss always aggregates per sequence "
+                "(DeepSeek-V3 Sec A.2 Eqs 17-20), got aggregation_level="
+                f"{config.aggregation_level!r}."
+            )
         self.top_k = config.top_k
         if get_spmd_backend() != "spmd_types":
             raise ValueError(
@@ -455,6 +468,11 @@ class SeqwiseLoadBalanceLoss(LoggedAuxLoss):
         f_BE = counts_BE * (E / (self.top_k * num_tokens_B.unsqueeze(1)))
         p_BE = prob_sums_BE / num_tokens_B.unsqueeze(1)
         loss_per_seq_B = (f_BE * p_BE).sum(dim=1)
+        # ``inject`` returns the carrier unchanged, so the MoE output tensor
+        # stays untouched (the scalar-loss-only contract under PP); the
+        # aux-loss gradient instead rides the top-k router scores, which are
+        # the activations feeding the gating weights, and reaches the gate
+        # through the ``topk_scores`` -> router graph on backward.
         return self.inject(loss_per_seq_B.sum(), carrier=topk_scores_BLK)
 
 
