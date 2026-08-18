@@ -9,7 +9,10 @@ import torch
 
 from torchtitan.components.quantization import Float8Linear
 from torchtitan.components.quantization.float8 import _get_float8_grouped_experts_cls
-from torchtitan.components.quantization.mx import _get_mxfp8_grouped_experts_cls
+from torchtitan.components.quantization.mx import (
+    _get_mxfp8_grouped_experts_cls,
+    MXFP8Linear,
+)
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import ConfigManager
 from torchtitan.models.common.decoder_sharding import colwise_config, rowwise_config
@@ -353,3 +356,44 @@ def test_quantized_grouped_experts():
     assert issubclass(float8_cls, GptOssGroupedExperts)
     assert hasattr(mxfp8_cls.Config, "swiglu_limit")
     assert hasattr(float8_cls.Config, "swiglu_limit")
+
+
+def test_mxfp8_linear_uses_fsdp_weight_wrapper():
+    pytest.importorskip("torchao")
+    if MXFP8Linear is None:
+        pytest.skip("torchao MXFP8Linear is unavailable")
+    from torchtitan.components.quantization.mxfp8_fsdp import MXFP8FSDPWeight
+
+    with pytest.raises(ValueError, match="in_features divisible by 32"):
+        MXFP8Linear.Config(in_features=127, out_features=128)
+    with pytest.raises(ValueError, match="out_features divisible by 32"):
+        MXFP8Linear.Config(in_features=128, out_features=127)
+
+    for sharding_config in (colwise_config(), rowwise_config()):
+        linear = MXFP8Linear.Config(
+            in_features=128,
+            out_features=128,
+            bias=False,
+            sharding_config=sharding_config,
+        ).build()
+        assert isinstance(linear.weight, MXFP8FSDPWeight)
+        assert linear._sharding_config is not None
+        assert linear._sharding_config.local_map is not None
+        assert "input" in linear._sharding_config.in_src_shardings
+        assert "input" in linear._sharding_config.in_dst_shardings
+
+
+def test_mxfp8_linear_loads_stock_checkpoint():
+    pytest.importorskip("torchao")
+    if MXFP8Linear is None:
+        pytest.skip("torchao MXFP8Linear is unavailable")
+    from torchtitan.components.quantization.mxfp8_fsdp import MXFP8FSDPWeight
+
+    stock = Linear.Config(in_features=128, out_features=96).build()
+    mxfp8 = MXFP8Linear.Config(in_features=128, out_features=96).build()
+    with torch.no_grad():
+        stock.weight.normal_()
+
+    mxfp8.load_state_dict(stock.state_dict())
+    assert isinstance(mxfp8.weight, MXFP8FSDPWeight)
+    assert torch.equal(mxfp8.weight._data, stock.weight)

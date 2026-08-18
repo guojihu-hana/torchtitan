@@ -11,40 +11,19 @@ from typing import Literal
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
 from .utils import swap_token_dispatcher
 
+_mxfp8_linear_import_error: ImportError | None = None
+
 try:
-    from torchao.prototype.moe_training.mxfp8_linear import (
-        MXFP8Linear as TorchAOMXFP8Linear,
-    )
+    from .mxfp8_linear import MXFP8Linear
 
-    class MXFP8Linear(TorchAOMXFP8Linear, Module):
-        """Inherits from Module (not Linear) to satisfy the Module protocol
-        (init_states, _param_init) while avoiding MRO conflicts with
-        Linear.__init__. Config still inherits from Linear.Config for
-        field compatibility.
-        """
-
-        @dataclass(kw_only=True, slots=True)
-        class Config(Linear.Config):
-            """Drop-in replacement for Linear.Config that builds MXFP8Linear."""
-
-            pass
-
-        def __init__(self, config: Config):
-            TorchAOMXFP8Linear.__init__(
-                self,
-                config.in_features,
-                config.out_features,
-                bias=config.bias,
-            )
-
-except ImportError:
+except ImportError as import_error:
     MXFP8Linear = None
+    _mxfp8_linear_import_error = import_error
 
 
 class MXFP8LinearConverter(QuantizationConverter):
@@ -64,8 +43,9 @@ class MXFP8LinearConverter(QuantizationConverter):
 
         if MXFP8Linear is None:
             raise ImportError(
-                "torchao is not installed. Please install it to use MXFP8 linear layers."
-            )
+                "TorchAO with mxfp8_quantize_cuda_3d is required for "
+                "MXFP8 linear layers. Install TorchAO from source."
+            ) from _mxfp8_linear_import_error
 
         if not has_cuda_capability(10, 0):
             raise ValueError("MXFP8 is only supported on SM100 or later architectures")

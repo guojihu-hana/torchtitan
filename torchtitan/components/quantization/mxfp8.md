@@ -24,19 +24,28 @@ MXFP8 training can provide substantial training speedups for models where the ma
 
 - NVIDIA B200 (SM100 or SM100a)
 - PyTorch nightly
-- TorchAO v0.14.0 or newer ([TorchAO Installation Guide](https://github.com/pytorch/ao#installation))
-
-Note: GB200 is also supported but requires building torchao from source (see installation guide above).
+- TorchAO 0.18.0 or later, with `nvidia-cutlass-dsl` and `apache-tvm-ffi`
 
 ### How MXFP8 Works
 
 MXFP8 differs from standard Float8 training in its scaling approach:
 
 - **Granular scaling factor**: Instead of using a single scale factor per tensor (tensorwise) or per row/column (rowwise), MXFP8 uses a more granular, block-based scaling with a default block size of 1x32 elements. Each block of 32 elements shares a common scale factor. The data dtype is `torch.float8_e4m3fn`, and the scale factor dtype is `torch.float8_e8mfnu`.
-- **Native hardware support**: On NVIDIA B200 (Blackwell) GPUs, MXFP8 GEMMs and Grouped GEMMs are accelerated using cuBLAS and CUTLASS kernels exposed via `torch._scaled_mm` and `torch._scaled_grouped_mm`, achieving up to 2x speedup over bfloat16 on common shapes.
-- **Dynamic quantization**: For every MXFP8 Linear or Grouped GEMM, activations and weights are dynamically quantized to MXFP8, then a MXFP8 GEMM/Grouped GEMM is performed, resulting in a net speedup.
+- **Native hardware support**: On NVIDIA B200 (Blackwell) GPUs, MXFP8 GEMMs and Grouped GEMMs are accelerated using cuBLAS and CUTLASS kernels exposed via `torch.nn.functional.scaled_mm` and `torch._scaled_grouped_mm`, achieving up to 2x speedup over bfloat16 on common shapes.
+- **Dynamic activation quantization**: Linear and Grouped GEMM activations use
+  standard 1x32 MXFP8 scaling and are dynamically quantized for each operation.
+- **FSDP-managed dense weights**: After FSDP all-gathers a dense Linear weight
+  in BF16, TorchTitan's post-all-gather hook uses TorchAO's 32x32 quantization
+  kernel to create square-tiled FPROP and DGRAD representations. FSDP owns
+  those buffers, so their lifetime follows the normal reshard-after-forward
+  and reshard-after-backward policies. The BF16 all-gather output is retained
+  until FSDP reshards.
 
 ### MXFP8 for Linear Modules
+
+The current dense-weight cache supports only 32x32 weight tiles. Both local
+weight dimensions must therefore be divisible by 32. This restriction applies
+only to weights; activations continue to use standard 1x32 scaling.
 
 #### Usage
 
@@ -210,7 +219,6 @@ All distributed communication for MXFP8 training is currently done in high preci
 ### Known Limitations
 - Currently in prototype stage - no BC guarantees.
 - Requires torch nightly - important bug fixes have landed since 2.9.1
-- For GB200s, requires building torchao from source
 
 ### Additional Resources
 
