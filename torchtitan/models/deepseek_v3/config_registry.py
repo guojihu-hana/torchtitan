@@ -85,7 +85,8 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
     # layers in attention, the shared experts, and the dense-layer feed-forward.
     # fqns is an include-list (substring match), so the MoE router gate
     # (moe.router.gate) and lm_head are left in bf16.
-    # MXFP8 grouped GEMMs require 32-row aligned expert token groups.
+    # pad_multiple=128 is required by the CuTeDSL quantization kernel
+    # on sm_100 (e.g. B200)
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
@@ -98,7 +99,7 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
             ),
             MXFP8GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
-                pad_multiple=32,
+                pad_multiple=128,
             ),
         ],
     )

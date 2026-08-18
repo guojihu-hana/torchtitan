@@ -38,16 +38,6 @@ MXFP8 differs from standard Float8 training in its scaling approach:
 
 ### MXFP8 for Linear Modules
 
-TorchTitan's `MXFP8Linear` operates directly on normal activation tensors. Its
-forward pass uses TorchAO's fused rowwise and columnwise MXFP8 quantizer,
-consumes the rowwise representation in the forward GEMM, and saves only the
-columnwise quantized activation for wgrad. The BF16 activation is not saved by
-the linear autograd function. The parameter uses a TorchAO tensor subclass so
-FSDP can quantize the unsharded BF16 weight after all-gather, cache both the
-forward and dgrad MXFP8 representations across pipeline microbatches, and
-release them after the final backward. Scale-factor swizzling is currently
-performed by separate kernels before the Blackwell scaled GEMMs.
-
 #### Usage
 
 Quantization is applied at config time in your `model_registry()` function via the `quantization` parameter. Each converter walks the model config tree and swaps config types so that quantized modules are built directly.
@@ -85,7 +75,7 @@ MXFP8 training requires NVIDIA B200 (SM100) or newer GPUs.
 
 ### MXFP8 for Grouped GEMMs (MoE)
 
-For Mixture-of-Experts (MoE) models, MXFP8 can accelerate the expert computation through dynamically quantized grouped GEMMs. TorchTitan's grouped path uses normal tensors rather than TorchAO tensor subclasses. It fuses rowwise and columnwise activation quantization, uses the rowwise representation for forward, and saves the columnwise representation for wgrad instead of saving the BF16 activation. In the common SwiGLU experts, gate and up share one quantized copy of the routed input. The intermediate activation feeding the output projection is quantized separately.
+For Mixture-of-Experts (MoE) models, MXFP8 can accelerate the expert computation through dynamically quantized grouped GEMMs.
 
 #### Usage
 
@@ -129,9 +119,7 @@ model_spec = model_registry(
 
 **Important Notes:**
 
-* **Token group alignment**: For MoE training with MXFP8, token group sizes must be multiples of 32 (the MXFP8 block size). The token dispatcher is automatically swapped to a padded variant (`TorchAOTokenDispatcher` or `HybridEPTokenDispatcher`) by `swap_token_dispatcher()` when the converter runs. Expert parallelism (EP) must be enabled.
-
-* **MinimalAsyncEP**: The current MinimalAsyncEP dispatcher does not pad each expert segment independently, so it is not yet compatible with MXFP8 grouped GEMMs even though the communication implementation does not otherwise depend on the GEMM dtype.
+* **Token group alignment**: For MoE training with MXFP8, token group sizes must be multiples of 32 (the MXFP8 block size). The token dispatcher is automatically swapped to a padded variant (`TorchAOTokenDispatcher` or `DeepEPTokenDispatcher`) by `swap_token_dispatcher()` when the converter runs. Expert parallelism (EP) must be enabled.
 
 * **torch.compile recommendation**: All benchmarks in this document were run with `torch.compile` enabled. We recommend using `torch.compile` for best performance.
 

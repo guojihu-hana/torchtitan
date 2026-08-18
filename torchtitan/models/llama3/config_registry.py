@@ -107,18 +107,6 @@ def llama3_debugmodel_float8() -> Trainer.Config:
     return config
 
 
-def llama3_debugmodel_mxfp8() -> Trainer.Config:
-    config = llama3_debugmodel()
-    config.compile = CompileConfig(enable=True, components=["model"])
-    config.model_spec = model_registry(
-        "debugmodel",
-        converters=[
-            MXFP8LinearConverter.Config(model_compile_enabled=True),
-        ],
-    )
-    return config
-
-
 def llama3_debugmodel_nvfp4() -> Trainer.Config:
     config = llama3_debugmodel()
     config.parallelism.spmd_backend = "spmd_types"

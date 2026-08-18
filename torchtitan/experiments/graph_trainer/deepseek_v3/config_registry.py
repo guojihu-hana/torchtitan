@@ -46,7 +46,7 @@ def graph_trainer_deepseek_v3_debugmodel_mxfp8() -> GraphTrainer.Config:
             ),
             MXFP8GroupedExpertsConverter.Config(
                 model_compile_enabled=True,
-                pad_multiple=32,
+                pad_multiple=128,
             ),
         ],
     )
