@@ -11,40 +11,23 @@ from typing import Literal
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
-from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
 from .utils import swap_token_dispatcher
 
 try:
-    from torchao.prototype.moe_training.mxfp8_linear import (
-        MXFP8Linear as TorchAOMXFP8Linear,
-    )
-
-    class MXFP8Linear(TorchAOMXFP8Linear, Module):
-        """Inherits from Module (not Linear) to satisfy the Module protocol
-        (init_states, _param_init) while avoiding MRO conflicts with
-        Linear.__init__. Config still inherits from Linear.Config for
-        field compatibility.
-        """
-
-        @dataclass(kw_only=True, slots=True)
-        class Config(Linear.Config):
-            """Drop-in replacement for Linear.Config that builds MXFP8Linear."""
-
-            pass
-
-        def __init__(self, config: Config):
-            TorchAOMXFP8Linear.__init__(
-                self,
-                config.in_features,
-                config.out_features,
-                bias=config.bias,
-            )
+    from .mxfp8_linear import MXFP8Linear
 
 except ImportError:
     MXFP8Linear = None
+
+try:
+    from .mxfp8_grouped_mm import mxfp8_grouped_mm, mxfp8_swiglu_grouped_experts_forward
+
+except ImportError:
+    mxfp8_grouped_mm = None
+    mxfp8_swiglu_grouped_experts_forward = None
 
 
 class MXFP8LinearConverter(QuantizationConverter):
@@ -108,8 +91,9 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
     ``GroupedExperts`` and ``GptOssGroupedExperts``). The returned class has a
     proper ``_owner`` set by ``__init_subclass__``.
 
-    The subclass overrides ``_grouped_mm`` to call torchao's
-    ``_quantize_then_scaled_grouped_mm``.
+    The common SwiGLU path quantizes its input once for the gate and up grouped
+    GEMMs. Other subclasses use the same normal-tensor grouped GEMM autograd
+    function through the ``_grouped_mm`` seam.
     """
     if parent_cls in _mxfp8_experts_cache:
         return _mxfp8_experts_cache[parent_cls]
@@ -123,22 +107,23 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
 
         def __init__(self, config: Config):
             super().__init__(config)
-            from torchao.prototype.moe_training.config import (
-                MXFP8TrainingOpConfig,
-                MXFP8TrainingRecipe,
-            )
+            if config.recipe_name != "mxfp8_rceil":
+                raise ValueError(
+                    "MXFP8 grouped experts only support recipe_name="
+                    f"'mxfp8_rceil'; got {config.recipe_name!r}."
+                )
 
-            recipe = MXFP8TrainingRecipe(config.recipe_name)
-            self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+        def forward(self, x_RD, num_tokens_per_expert_E):
+            if hasattr(self, "w1_EFD"):
+                assert mxfp8_swiglu_grouped_experts_forward is not None
+                return mxfp8_swiglu_grouped_experts_forward(
+                    self, x_RD, num_tokens_per_expert_E
+                )
+            return super().forward(x_RD, num_tokens_per_expert_E)
 
         def _grouped_mm(self, *, A, B_t, offs):
-            from torchao.prototype.moe_training.utils import (
-                _quantize_then_scaled_grouped_mm,
-            )
-
-            return _quantize_then_scaled_grouped_mm(
-                A, B_t, config=self._mxfp8_op_config, offs=offs
-            )
+            assert mxfp8_grouped_mm is not None
+            return mxfp8_grouped_mm(A, B_t, offs)
 
     MXFP8GroupedExperts.__name__ = f"MXFP8{parent_cls.__name__}"
     MXFP8GroupedExperts.__qualname__ = f"MXFP8{parent_cls.__name__}"
@@ -161,7 +146,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         pad_multiple: int = 32
         """
         Pad per-expert token groups to this multiple for MXFP8 grouped GEMM alignment.
-        The CuTeDSL quantization kernel on sm_100 requires multiples of 128.
+        The fused rowwise/columnwise CUDA quantizer requires multiples of 32.
         """
 
     def __init__(self, config: Config):
@@ -171,9 +156,20 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             raise ImportError(
                 "torchao is not installed. Please install it to use MXFP8 MoE training."
             )
+        if mxfp8_grouped_mm is None or mxfp8_swiglu_grouped_experts_forward is None:
+            raise ImportError(
+                "The TorchAO MXFP8 grouped-GEMM kernels are unavailable in this "
+                "environment."
+            )
 
         if not has_cuda_capability(10, 0):
             raise ValueError("MXFP8 is only supported on SM100 or later architectures")
+
+        if self.config.pad_multiple % 32:
+            raise ValueError(
+                "MXFP8 grouped GEMM pad_multiple must be divisible by 32; "
+                f"got {self.config.pad_multiple}."
+            )
 
         if not self.config.model_compile_enabled:
             logger.warning(
