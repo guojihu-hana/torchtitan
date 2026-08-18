@@ -237,8 +237,15 @@ def run_1gpu_numerics(output_dir: Path) -> None:
 
 
 def run_8gpu_numerics(output_dir: Path) -> None:
+    failed_tests: list[str] = []
     for test_name, options in build_8gpu_numerics_test_list(output_dir).items():
-        _run_loss_compare(test_name, options, ngpus=8)
+        try:
+            _run_loss_compare(test_name, options, ngpus=8)
+        except subprocess.CalledProcessError:
+            failed_tests.append(test_name)
+
+    if failed_tests:
+        raise RuntimeError("8-GPU numerics tests failed: " + ", ".join(failed_tests))
 
 
 _TEST_SUITES = {
