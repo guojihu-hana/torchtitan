@@ -19,7 +19,6 @@ import torch
 import torch.distributed.checkpoint.stateful
 import tyro
 from torch.distributed.elastic.multiprocessing.errors import record
-
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDEX
@@ -518,9 +517,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     self.loss_fn.set_lm_head(
                         lm_head  # pyrefly: ignore[bad-argument-type]
                     )
-                    self.model_parts[
-                        -1
-                    ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
+                    self.model_parts[-1]._skip_lm_head = (
+                        True  # pyrefly: ignore[bad-argument-type]
+                    )
             else:
                 assert len(self.model_parts) == 1
                 lm_head = self.model_parts[0].lm_head
@@ -528,9 +527,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     lm_head is not None
                 ), "Model must have lm_head for ChunkedLossWrapper"
                 self.loss_fn.set_lm_head(lm_head)  # pyrefly: ignore[bad-argument-type]
-                self.model_parts[
-                    0
-                ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
+                self.model_parts[0]._skip_lm_head = (
+                    True  # pyrefly: ignore[bad-argument-type]
+                )
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
@@ -701,14 +700,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         once per microbatch on the PP path, so token accounting matches the
         batch stream.
 
-        The 4th element (``local_ntokens``) is a transitional workaround; see
-        ``BaseModel.preprocess_inputs`` for the ``TODO(return-type)`` rationale.
+        The 4th returned value of ``model.preprocess_inputs`` (``local_ntokens``)
+        is a transitional workaround; see ``BaseModel.preprocess_inputs`` for the
+        ``TODO(return-type)`` rationale.
+
+        TODO: fold labels into the batch at the dataloader instead of here --
+        have the dataloader yield a single input_dict with "labels" already
+        included, so preprocess_inputs receives it directly and this merge
+        (and the separate `labels` param threaded through the microbatch/PP
+        paths) can go away.
         """
         inputs, labels, extra_kwargs, local_ntokens = cast(
             BaseModel, self.model_parts[0]
         ).preprocess_inputs(
-            input_dict,
-            labels,
+            {**input_dict, "labels": labels},
             parallel_dims=self.parallel_dims,
             device=self.device,
             parallelism=self.config.parallelism,
