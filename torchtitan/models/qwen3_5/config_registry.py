@@ -57,7 +57,7 @@ def qwen35_debugmodel() -> Trainer.Config:
         ),
         training=TrainingConfig(
             local_batch_size=1,
-            seq_len=512,
+            seq_len=4096,
             steps=10,
         ),
         checkpoint=CheckpointManager.Config(
