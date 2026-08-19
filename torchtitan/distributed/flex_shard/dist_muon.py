@@ -27,8 +27,8 @@ from ._optimizer_reshard_schedule import (
     _bind_bucket_configs,
     _BucketPlanningContext,
     _build_bucket_plans,
+    _build_dim0_shard_redistribution_plan,
     _build_owned_redistribution_plan,
-    _build_replicated_to_dim0_shard_plan,
     _device_mesh_ranks,
     _dtensor_storage_regions,
     _ParticipantPartition,
@@ -1087,7 +1087,7 @@ def _build_parameter_redistribution_plan(
         return None
     assert isinstance(transition, _RedistributionTransition)
 
-    storage_regions = _dtensor_storage_regions(
+    group_local_storage_shape, storage_regions = _dtensor_storage_regions(
         compute_layout.param,
         group.participants,
         required_storage_mesh_axis=(compute_layout.redistribution_storage_mesh_axis),
@@ -1106,10 +1106,11 @@ def _build_parameter_redistribution_plan(
     assert owner_rank is None
     assert type(compute_sharding) is Shard
     if tuple(compute_layout.global_compute_shape) == tuple(compute_layout.param.shape):
-        return _build_replicated_to_dim0_shard_plan(
+        return _build_dim0_shard_redistribution_plan(
             storage_regions,
             participants=group.participants,
-            logical_shape=tuple(compute_layout.global_compute_shape),
+            shard_participants=group.mesh_axis_participants,
+            logical_shape=group_local_storage_shape,
         )
 
     return _build_batched_matrix_redistribution_plan(
@@ -1390,6 +1391,7 @@ def _resolve_storage_to_compute_transition(
     redistribution_storage_mesh_axis = (
         transport_mesh_axes[0] if transport_mesh_axes else None
     )
+    allowed_orthogonal_dim0_shard = False
     if redistribution_storage_mesh_axis is not None:
         redistribution_axis_name = mesh_axis_names[redistribution_storage_mesh_axis]
         for storage_mesh_axis, placement in enumerate(param.placements):
@@ -1416,6 +1418,21 @@ def _resolve_storage_to_compute_transition(
                         redistribution_storage_mesh_axis
                     )
                 )
+                if (
+                    not allowed_orthogonal_dim0_shard
+                    and compute_view is None
+                    and param.ndim == 3
+                    and type(redistribution_storage_placement) is Shard
+                    and _normalize_dim(redistribution_storage_placement.dim, param.ndim)
+                    == 1
+                    and type(redistribution_compute_sharding) is Shard
+                    and _normalize_dim(redistribution_compute_sharding.dim, param.ndim)
+                    == 0
+                    and type(placement) is Shard
+                    and _normalize_dim(placement.dim, param.ndim) == 0
+                ):
+                    allowed_orthogonal_dim0_shard = True
+                    continue
                 if (
                     type(redistribution_storage_placement) is Shard
                     and type(redistribution_compute_sharding) in (Shard, BlockShard)
@@ -1515,6 +1532,7 @@ def _resolve_storage_to_compute_transition(
             type(source_sharding) is not Replicate
             and type(target_sharding) is not BlockShard
             and source_sharding != target_sharding
+            and not allowed_orthogonal_dim0_shard
         ):
             axis_name = mesh_axis_names[redistribution_storage_mesh_axis]
             raise NotImplementedError(

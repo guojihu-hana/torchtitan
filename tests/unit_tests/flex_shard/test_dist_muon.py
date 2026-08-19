@@ -248,43 +248,73 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
         return "cuda"
 
     @with_comms
-    def test_rejects_insufficient_expert_storage_layout(self):
+    def test_preserves_ep_shard_during_efsdp_redistribution(self):
+        lr = 0.03
+        weight_decay = 0.2
         mesh = init_device_mesh(
             self.device_type,
             (2, 2),
             mesh_dim_names=("efsdp", "ep"),
         )
-        num_experts = 2
-        self.assertGreater(mesh["efsdp"].size() * mesh["ep"].size(), num_experts)
         device = torch.device(self.device_type, self.rank)
-        value = torch.arange(
-            num_experts * 16,
-            device=device,
-            dtype=torch.float32,
-        ).reshape(num_experts, 4, 4)
+        value = torch.arange(30, device=device).reshape(2, 5, 3).float().div_(13)
+        storage_placements = (Shard(1), Shard(0))
         parameter = torch.nn.Parameter(
-            distribute_tensor(value, mesh, (Shard(1), Shard(0)))
+            distribute_tensor(value.clone(), mesh, storage_placements)
         )
         fqn = "layers.0.routed_experts.inner_experts.w1_EFD"
+        optimizer = build_dist_muon(
+            [{"params": [parameter], "param_names": [fqn]}],
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=0.8,
+            nesterov=True,
+            ns_steps=2,
+            compute_sharding_by_fqn={
+                fqn: ComputeLayout(
+                    shardings_by_mesh_axis={
+                        "efsdp": Shard(0),
+                        "ep": Shard(0),
+                    },
+                )
+            },
+            bucket_configs=[BucketConfig(patterns=(fqn,))],
+        )
+        grad = (
+            torch.arange(30, device=device)
+            .reshape_as(value)
+            .float()
+            .mul_(0.37)
+            .add_(0.2)
+            .sin_()
+        )
+        parameter.grad = distribute_tensor(grad.clone(), mesh, storage_placements)
 
-        with self.assertRaisesRegex(
-            NotImplementedError,
-            "cannot redistribute storage on mesh axis 'efsdp'.*"
-            "preserving Shard\\(0\\) storage on mesh axis 'ep'.*"
-            "orthogonal-shard redistribution is not implemented",
-        ):
-            build_dist_muon(
-                [{"params": [parameter], "param_names": [fqn]}],
-                compute_sharding_by_fqn={
-                    fqn: ComputeLayout(
-                        shardings_by_mesh_axis={
-                            "efsdp": Shard(0),
-                            "ep": Shard(0),
-                        },
-                    )
-                },
-                bucket_configs=[BucketConfig(patterns=(fqn,))],
-            )
+        references = tuple(torch.nn.Parameter(matrix.clone()) for matrix in value)
+        reference_optimizer = torch.optim.Muon(
+            references,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=0.8,
+            nesterov=True,
+            ns_steps=2,
+        )
+        for reference, matrix_grad in zip(references, grad, strict=True):
+            reference.grad = matrix_grad.clone()
+
+        optimizer.step()
+        reference_optimizer.step()
+
+        decay = 1 - lr * weight_decay
+        expected = torch.stack([reference.detach() for reference in references])
+        adjusted_lr = _adjust_muon_learning_rate(lr, None, references[0].shape)
+        torch.testing.assert_close(
+            (value * decay - parameter.full_tensor()) / adjusted_lr,
+            (value * decay - expected) / adjusted_lr,
+            rtol=0,
+            atol=2e-2,
+        )
+        self.assertEqual(parameter.placements, storage_placements)
 
 
 if __name__ == "__main__":
